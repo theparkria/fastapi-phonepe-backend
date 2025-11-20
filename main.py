@@ -1376,6 +1376,7 @@ logger.info("ENV CHECK - SUPABASE_URL present: %s", bool(os.getenv("SUPABASE_URL
 logger.info("ENV CHECK - SUPABASE_SERVICE_KEY present: %s", bool(os.getenv("SUPABASE_SERVICE_KEY")))
 logger.info("ENV CHECK - PHONEPE_MERCHANT_ID present: %s", bool(os.getenv("PHONEPE_MERCHANT_ID")))
 logger.info("ENV CHECK - PHONEPE_CLIENT_SECRET present: %s", bool(os.getenv("PHONEPE_CLIENT_SECRET")))
+logger.info("ENV CHECK - PHONEPE_ENV present: %s", bool(os.getenv("PHONEPE_ENV")))
 
 # now safe to import app dependencies that may read env
 from fastapi import FastAPI, HTTPException, Request, Query
@@ -1388,7 +1389,8 @@ from supabase import create_client, Client
 from passlib.context import CryptContext
 
 # local phonepe helper (import after env loaded)
-from phonepe_client import create_checkout
+# phonepe_client should implement token handling and environment selection (sandbox/prod)
+from phonepe_client import create_checkout  # ensure you replaced phonepe_client.py with the improved version
 
 # -----------------------
 # Supabase client
@@ -1406,7 +1408,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 app = FastAPI(title="Parkria Backend - PhonePe")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # set to your app domain(s) in production
+    allow_origins=["*"],  # restrict in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1526,7 +1528,6 @@ def add_vehicle(data: AddVehicleRequest):
 @app.get("/vehicles")
 def get_user_vehicles(user_id: str = Query(...)):
     res = supabase.table("vehicles").select("vehicle_id, car_number").eq("user_id", user_id).order("vehicle_id").execute()
-    # supabase returns {'data': [...]} for .execute(); create_client wrapper returns .data
     return res.data or []
 
 # ======================
@@ -1626,46 +1627,64 @@ def book_slot(data: ParkingSlotBookRequest):
 # ======================
 @app.post("/create-payment")
 def create_payment(req: PaymentRequest):
-    """
-    Called by Flutter app.
-    Steps:
-      - build merchant_order_id
-      - call PhonePe create checkout (via phonepe_client.create_checkout)
-      - save order row in supabase 'orders' table (merchant_order_id unique)
-      - return checkout_url & merchant_order_id to client
-    """
-    if req.amount <= 0:
-        raise HTTPException(status_code=400, detail="Invalid amount")
-
-    merchant_order_id = f"ord-{req.booking_id}-{int(datetime.utcnow().timestamp())}"
-    amount_paise = int(req.amount) * 100
-
+    # coerce + validate amount
     try:
-        logger.info(f"Creating checkout: merchant_order_id={merchant_order_id} amount_paise={amount_paise}")
-        phonepe_resp = create_checkout(merchant_order_id=merchant_order_id, amount_paise=amount_paise, booking_id=req.booking_id, user_id=req.user_id)
+        amount_val = float(req.amount)
+    except Exception:
+        raise HTTPException(status_code=422, detail="Invalid 'amount' — must be numeric")
+    if amount_val <= 0:
+        raise HTTPException(status_code=400, detail="Invalid amount; must be > 0")
+
+    # merchant_order_id must be unique per attempt - include timestamp
+    merchant_order_id = f"ord-{req.booking_id}-{int(datetime.utcnow().timestamp())}"
+    amount_paise = int(round(amount_val * 100))
+
+    # coerce user_id to string; if your DB expects UUID ensure frontend sends a proper UUID.
+    user_id_str = str(req.user_id)
+
+    # basic heuristic to detect obviously-bad user ids (avoid common DB insertion failures)
+    if len(user_id_str) < 6:
+        logger.warning("Received suspiciously short user_id; ensure frontend sends user UUID or valid id: %s", user_id_str)
+
+    logger.info("Creating checkout: merchant_order_id=%s amount_paise=%s user_id=%s", merchant_order_id, amount_paise, user_id_str)
+    try:
+        phonepe_resp = create_checkout(
+            merchant_order_id=merchant_order_id,
+            amount_paise=amount_paise,
+            booking_id=req.booking_id,
+            user_id=user_id_str,
+        )
     except Exception as e:
         logger.exception("PhonePe create_checkout failed")
-        raise HTTPException(status_code=500, detail=f"PhonePe error: {e}")
+        # Return helpful message for frontend to display
+        raise HTTPException(status_code=502, detail=f"PhonePe error: {e}")
 
-    # PhonePe response may contain redirectUrl and orderId in the top-level or nested 'data'.
-    redirect_url = phonepe_resp.get("redirectUrl") or (phonepe_resp.get("data") or {}).get("redirectUrl")
-    phonepe_order_id = phonepe_resp.get("orderId") or (phonepe_resp.get("data") or {}).get("orderId")
-    state = phonepe_resp.get("state") or (phonepe_resp.get("data") or {}).get("state") or "PENDING"
+    # PhonePe sometimes returns values at top level or under 'data'
+    redirect_url = None
+    phonepe_order_id = None
+    state = "PENDING"
 
-    # Persist order in Supabase
+    if isinstance(phonepe_resp, dict):
+        redirect_url = phonepe_resp.get("redirectUrl") or (phonepe_resp.get("data") or {}).get("redirectUrl")
+        phonepe_order_id = phonepe_resp.get("orderId") or (phonepe_resp.get("data") or {}).get("orderId")
+        state = phonepe_resp.get("state") or (phonepe_resp.get("data") or {}).get("state") or state
+
+    logger.info("PhonePe response parsed redirect_url=%s order_id=%s state=%s", redirect_url, phonepe_order_id, state)
+
+    # Save order to DB. If DB write fails (e.g. invalid UUID) return checkout_url but include warning.
     try:
         supabase.table("orders").insert({
             "merchant_order_id": merchant_order_id,
             "booking_id": req.booking_id,
-            "user_id": req.user_id,
+            "user_id": user_id_str,
             "amount": amount_paise,
             "status": state,
             "phonepe_order_id": phonepe_order_id,
             "created_at": datetime.utcnow().isoformat()
         }).execute()
     except Exception as e:
+        # log and return successful response but with warning (so frontend can still open PayPage)
         logger.exception("Supabase insert orders failed")
-        # still return checkout_url so client can proceed — manual reconciliation may be needed
         return {
             "checkout_url": redirect_url,
             "merchant_order_id": merchant_order_id,
@@ -1680,6 +1699,7 @@ def create_payment(req: PaymentRequest):
         "phonepe_order_id": phonepe_order_id,
         "state": state
     }
+
 
 @app.post("/payment/callback")
 async def payment_callback(req: Request):
@@ -1738,3 +1758,4 @@ def order_status(merchant_order_id: str):
         "transaction_id": order.get("phonepe_order_id"),
         "amount": order.get("amount")
     }
+
