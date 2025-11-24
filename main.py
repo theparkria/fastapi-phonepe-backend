@@ -1,3 +1,4 @@
+# main.py
 import os
 from pathlib import Path
 import logging
@@ -22,7 +23,7 @@ logger.info("ENV CHECK - PHONEPE_CLIENT_SECRET present: %s", bool(os.getenv("PHO
 logger.info("ENV CHECK - PHONEPE_ENV present: %s", bool(os.getenv("PHONEPE_ENV")))
 
 # now safe to import app dependencies that may read env
-from fastapi import FastAPI, HTTPException, Request, Query, Header
+from fastapi import FastAPI, HTTPException, Request, Query, Header, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
@@ -31,9 +32,9 @@ from supabase import create_client, Client
 # password hashing for signup/login - use bcrypt_sha256 to avoid 72-byte limit
 from passlib.context import CryptContext
 
-# local phonepe helper (import after env loaded)
-# phonepe_client should implement token handling and environment selection (sandbox/prod)
-from phonepe_client import create_checkout  # ensure you replaced phonepe_client.py with the improved version
+# phonepe_client (production-ready)
+# make sure phonepe_client.py from the improved version is present in the project
+from phonepe_client import create_order, order_status as phonepe_order_status, token_info as phonepe_token_info
 
 # -----------------------
 # Supabase client
@@ -51,7 +52,7 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 app = FastAPI(title="Parkria Backend - PhonePe")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # restrict in production
+    allow_origins=["*"],  # restrict in production to your frontend origin(s)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -60,8 +61,6 @@ app.add_middleware(
 # -----------------------
 # Security headers middleware required by PhonePe
 # -----------------------
-from fastapi import Response
-
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
     """
@@ -134,13 +133,10 @@ def verify_phonepe_signature(raw_body: bytes, signature_header: str | None) -> b
     """
     Verify incoming PhonePe callback signature.
 
-    **IMPORTANT:** This implementation assumes the signature header contains
-    a hex-encoded HMAC-SHA256 of the raw request body using your
-    PHONEPE_CLIENT_SECRET as key.
-
-    *This is an example only.* Please consult PhonePe docs for the exact
-    header name and algorithm (they might use base64-encoded HMAC or RSA).
-    Update this function to match the production spec provided by PhonePe.*
+    NOTE: PhonePe may use base64-encoded HMAC or other signature formats.
+    This stub assumes hex-encoded HMAC-SHA256 of the raw request body using
+    PHONEPE_CLIENT_SECRET as key. Update this to match the PhonePe spec
+    used by your integration (base64 vs hex, header name, algorithm).
     """
     secret = os.getenv("PHONEPE_CLIENT_SECRET")
     if not secret:
@@ -153,8 +149,7 @@ def verify_phonepe_signature(raw_body: bytes, signature_header: str | None) -> b
 
     try:
         # compute hmac sha256 hex digest
-        computed = hmac.new(secret.encode('utf-8'), raw_body, hashlib.sha256).hexdigest()
-        # Use constant-time comparison
+        computed = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
         return hmac.compare_digest(computed.lower(), signature_header.lower())
     except Exception as e:
         logger.exception("Failed verifying signature: %s", e)
@@ -331,65 +326,69 @@ def create_payment(req: PaymentRequest):
     if len(user_id_str) < 6:
         logger.warning("Received suspiciously short user_id; ensure frontend sends user UUID or valid id: %s", user_id_str)
 
-    logger.info("Creating checkout: merchant_order_id=%s amount_paise=%s user_id=%s", merchant_order_id, amount_paise, user_id_str)
+    logger.info("Creating PhonePe order: merchant_order_id=%s amount_paise=%s user_id=%s", merchant_order_id, amount_paise, user_id_str)
     try:
-        phonepe_resp = create_checkout(
+        phonepe_resp = create_order(
             merchant_order_id=merchant_order_id,
             amount_paise=amount_paise,
-            booking_id=req.booking_id,
-            user_id=user_id_str,
+            expire_after=1200,
+            meta_info={"udf1": str(req.booking_id), "udf2": user_id_str},
         )
     except Exception as e:
-        logger.exception("PhonePe create_checkout failed")
-        # Return helpful message for frontend to display
+        logger.exception("PhonePe create_order failed")
         raise HTTPException(status_code=502, detail=f"PhonePe error: {e}")
 
-    # PhonePe may return different shapes depending on SDK vs web checkout
-    response_payload = {
-        "merchant_order_id": merchant_order_id,
-        "state": "PENDING",
-    }
+    # PhonePe response handling - support top-level or nested 'data'
+    redirect_url = None
+    phonepe_order_id = None
+    state = "PENDING"
+    token = None
 
     if isinstance(phonepe_resp, dict):
-        # SDK-order (preferred) returns orderId + token
-        if phonepe_resp.get("orderId") and phonepe_resp.get("token"):
-            response_payload.update({
-                "order_id": phonepe_resp.get("orderId"),
-                "order_token": phonepe_resp.get("token"),
-                "flow": "sdk",
-            })
-        # fallback web checkout may return redirectUrl
-        elif phonepe_resp.get("redirectUrl") or (phonepe_resp.get("data") or {}).get("redirectUrl"):
-            response_payload.update({
-                "checkout_url": phonepe_resp.get("redirectUrl") or (phonepe_resp.get("data") or {}).get("redirectUrl"),
-                "flow": "web",
-            })
-        else:
-            # include raw response so frontend can debug if needed
-            response_payload.update({"raw": phonepe_resp})
+        # top-level keys
+        redirect_url = phonepe_resp.get("redirectUrl") or phonepe_resp.get("checkout_url") or phonepe_resp.get("checkoutUrl")
+        phonepe_order_id = phonepe_resp.get("orderId") or (phonepe_resp.get("data") or {}).get("orderId")
+        state = phonepe_resp.get("state") or (phonepe_resp.get("data") or {}).get("state") or state
+        token = phonepe_resp.get("token") or (phonepe_resp.get("data") or {}).get("token")
 
-    # Save order to DB. If DB write fails, still return checkout info but include warning.
+    logger.info("PhonePe response parsed redirect_url=%s order_id=%s state=%s token_present=%s", redirect_url, phonepe_order_id, state, bool(token))
+
+    # Save order to DB. If DB write fails return checkout_url but include warning.
     try:
         supabase.table("orders").insert({
             "merchant_order_id": merchant_order_id,
             "booking_id": req.booking_id,
             "user_id": user_id_str,
             "amount": amount_paise,
-            "status": response_payload.get("state"),
-            "phonepe_order_id": response_payload.get("order_id"),
+            "status": state,
+            "phonepe_order_id": phonepe_order_id,
             "created_at": datetime.utcnow().isoformat()
         }).execute()
     except Exception as e:
         logger.exception("Supabase insert orders failed")
-        response_payload["warning"] = f"Saved to DB failed: {e}"
+        return {
+            "checkout_url": redirect_url,
+            "merchant_order_id": merchant_order_id,
+            "phonepe_order_id": phonepe_order_id,
+            "state": state,
+            "token": token,
+            "warning": f"Saved to DB failed: {e}"
+        }
 
-    return response_payload
+    # Return checkout details to frontend/app
+    return {
+        "checkout_url": redirect_url,
+        "merchant_order_id": merchant_order_id,
+        "phonepe_order_id": phonepe_order_id,
+        "state": state,
+        "token": token
+    }
 
 @app.post("/payment/callback")
 async def payment_callback(req: Request, x_phonepe_signature: str | None = Header(None)):
     """
     PhonePe server-to-server callback. PhonePe will POST details here.
-    This route now verifies signature before trusting the payload.
+    This route verifies signature before trusting the payload.
     The example uses header 'X-PHONEPE-SIGNATURE' and HMAC-SHA256 hex digest.
     Replace with exact verification per PhonePe docs.
     """
@@ -432,7 +431,6 @@ async def payment_callback(req: Request, x_phonepe_signature: str | None = Heade
         logger.warning("Callback missing merchant_order_id: %s", payload)
         return {"message": "callback received but merchant id missing", "body": payload}
 
-
 @app.get("/payment-success")
 def payment_success():
     # Browser redirect target after payment — PhonePe will redirect user here.
@@ -471,7 +469,6 @@ def payment_success():
     """
     return HTMLResponse(content=html, status_code=200)
 
-
 @app.get("/order-status/{merchant_order_id}")
 def order_status(merchant_order_id: str):
     res = supabase.table("orders").select("*").eq("merchant_order_id", merchant_order_id).execute()
@@ -486,12 +483,10 @@ def order_status(merchant_order_id: str):
     }
 
 # --- Diagnostic endpoints (temporary) ---
-
-DIAG_ENV_VAR = "DIAG_SECRET"  # set this env var on Render to a secret value
+DIAG_ENV_VAR = "DIAG_SECRET"  # set this env var on your hosting platform to a secret value
 
 def _check_diag_key(x_diag: str | None):
     # simple header-based auth so only you can hit these endpoints
-    import os
     expected = os.getenv(DIAG_ENV_VAR)
     if not expected:
         # if DIAG_SECRET is not set, refuse to run diagnostics
@@ -532,35 +527,19 @@ def diag_bcrypt(x_diag: str | None = Header(None)):
 def diag_phonepe_token(x_diag: str | None = Header(None)):
     _check_diag_key(x_diag)
     """
-    Attempt a token fetch from PHONEPE_TOKEN_URL using configured env vars.
-    DOES NOT return token values. Returns status code and keys present in JSON.
+    Diagnostic: check whether a token exists and return expiry info.
+    This does NOT return the token string or any secret.
     """
-    import os, requests
-    token_url = os.getenv("PHONEPE_TOKEN_URL")
-    client_id = os.getenv("PHONEPE_CLIENT_ID") or os.getenv("PHONEPE_MERCHANT_ID")
-    client_secret = bool(os.getenv("PHONEPE_CLIENT_SECRET"))  # boolean only
-    if not token_url:
-        return {"error": "PHONEPE_TOKEN_URL not set in env"}
-    if not client_id:
-        return {"error": "PHONEPE_CLIENT_ID / PHONEPE_MERCHANT_ID missing"}
-    # perform request, but do not include client_secret in log or return
     try:
-        resp = requests.post(token_url, data={
-            "client_id": client_id,
-            "client_secret": os.getenv("PHONEPE_CLIENT_SECRET") or "",
-            "client_version": os.getenv("PHONEPE_CLIENT_VERSION","1"),
-            "grant_type": "client_credentials"
-        }, timeout=15)
+        info = phonepe_token_info()
     except Exception as e:
-        return {"error": f"token request failed: {str(e)}"}
-    # parse body keys if JSON
-    try:
-        j = resp.json()
-        keys = list(j.keys())
-    except Exception:
-        keys = None
-    return {"status_code": resp.status_code, "json_keys": keys}
+        logger.exception("phonepe_token_info failed")
+        return {"error": str(e)}
+    # info returns has_token, expires_at, expires_at_iso, issued_at
+    return info
+
 # --- end diagnostics ---
+
 
 
 

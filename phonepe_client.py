@@ -1,54 +1,204 @@
-import os
-import time
-import requests
+# phonepe_client.py
+"""
+Production-ready PhonePe client.
+
+Features:
+- OAuth token fetch + cache with optional Redis persistence
+- Safe locking to prevent concurrent token refreshes
+- Requests session with retries/backoff
+- Helpers: create_order, order_status, initiate_refund, refund_status
+- Configurable via environment variables
+"""
+from __future__ import annotations
+
+import json
 import logging
-from typing import Dict, Any, Optional
+import os
+import re
+import threading
+import time
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# Optional redis import (graceful fallback)
+try:
+    import redis
+except Exception:
+    redis = None  # type: ignore
 
 logger = logging.getLogger("phonepe_client")
-logger.setLevel(logging.INFO)
+logger.setLevel(os.getenv("PHONEPE_LOG_LEVEL", "INFO"))
 
-# Environment-driven config
-PHONEPE_ENV = os.getenv("PHONEPE_ENV", "prod").lower()  # prod by default
-PHONEPE_MERCHANT_ID = os.getenv("PHONEPE_MERCHANT_ID")
+# === Config from env ===
+PHONEPE_ENV = os.getenv("PHONEPE_ENV", "prod").lower()  # "prod" or "sandbox"
+PHONEPE_CLIENT_ID = os.getenv("PHONEPE_CLIENT_ID")  # prefer explicit
+PHONEPE_MERCHANT_ID = os.getenv("PHONEPE_MERCHANT_ID")  # sometimes called merchant id
 PHONEPE_CLIENT_SECRET = os.getenv("PHONEPE_CLIENT_SECRET")
 PHONEPE_CLIENT_VERSION = os.getenv("PHONEPE_CLIENT_VERSION", "1")
+PHONEPE_REDIRECT_URL = os.getenv("PHONEPE_REDIRECT_URL", "")
+PHONEPE_CALLBACK_URL = os.getenv("PHONEPE_CALLBACK_URL", "")
+PHONEPE_TOKEN_URL = os.getenv(
+    "PHONEPE_TOKEN_URL",
+    "https://api.phonepe.com/apis/identity-manager/v1/oauth/token"
+    if PHONEPE_ENV == "prod"
+    else "https://api-preprod.phonepe.com/apis/pg-sandbox/v1/oauth/token",
+)
+PHONEPE_CHECKOUT_BASE = os.getenv(
+    "PHONEPE_CHECKOUT_BASE",
+    "https://api.phonepe.com/apis/pg" if PHONEPE_ENV == "prod" else "https://api-preprod.phonepe.com/apis/pg-sandbox",
+)
+REDIS_URL = os.getenv("REDIS_URL")  # optional, e.g. redis://:password@host:6379/0
 
-# Endpoints (production by default)
-if PHONEPE_ENV == "prod":
-    PHONEPE_TOKEN_URL = os.getenv("PHONEPE_TOKEN_URL", "https://api.phonepe.com/apis/identity-manager/v1/oauth/token")
-    PHONEPE_CHECKOUT_BASE = os.getenv("PHONEPE_CHECKOUT_BASE", "https://api.phonepe.com/apis/pg")
-else:
-    PHONEPE_TOKEN_URL = os.getenv("PHONEPE_TOKEN_URL", "https://api-preprod.phonepe.com/apis/pg-sandbox/v1/oauth/token")
-    PHONEPE_CHECKOUT_BASE = os.getenv("PHONEPE_CHECKOUT_BASE", "https://api-preprod.phonepe.com/apis/pg-sandbox")
+# Behavior tuning
+TOKEN_REFRESH_MARGIN_SEC = int(os.getenv("PHONEPE_TOKEN_REFRESH_MARGIN_SEC", "60"))  # refresh if expiry within this
+HTTP_TIMEOUT = float(os.getenv("PHONEPE_HTTP_TIMEOUT", "20"))
+RETRY_TOTAL = int(os.getenv("PHONEPE_RETRY_TOTAL", "3"))
+RETRY_BACKOFF_FACTOR = float(os.getenv("PHONEPE_RETRY_BACKOFF_FACTOR", "0.5"))
 
-PHONEPE_REDIRECT_URL = os.getenv("PHONEPE_REDIRECT_URL")
-PHONEPE_CALLBACK_URL = os.getenv("PHONEPE_CALLBACK_URL")
+# Validate essentials early
+if not PHONEPE_CLIENT_SECRET:
+    logger.warning("PHONEPE_CLIENT_SECRET not set; OAuth calls will fail.")
+if not (PHONEPE_CLIENT_ID or PHONEPE_MERCHANT_ID):
+    logger.warning("PHONEPE_CLIENT_ID and PHONEPE_MERCHANT_ID not set; ensure one is configured.")
 
-if not PHONEPE_MERCHANT_ID or not PHONEPE_CLIENT_SECRET:
-    logger.warning("PHONEPE_MERCHANT_ID or PHONEPE_CLIENT_SECRET missing in environment. PhonePe calls will fail.")
+# === Redis client (optional) ===
+_redis = None
+if REDIS_URL and redis:
+    try:
+        _redis = redis.from_url(REDIS_URL, decode_responses=True)
+        # quick ping to ensure availability
+        _redis.ping()
+        logger.info("Connected to Redis for token caching.")
+    except Exception as e:
+        logger.exception("Failed to connect to Redis at REDIS_URL; falling back to in-memory cache: %s", e)
+        _redis = None
+elif REDIS_URL and not redis:
+    logger.warning("REDIS_URL provided but `redis` package not installed; falling back to in-memory cache.")
 
-# Token cache
-_token_cache: Dict[str, Any] = {"access_token": None, "token_type": None, "expires_at": 0}
+# === In-memory fallback cache ===
+_token_cache_lock = threading.Lock()
+_inmemory_token_cache: Dict[str, Any] = {"access_token": None, "token_type": None, "expires_at": 0, "issued_at": 0}
 
-def _is_token_valid() -> bool:
-    at = _token_cache.get("access_token")
-    exp = _token_cache.get("expires_at", 0)
-    return bool(at) and (time.time() + 5) < exp
+# === HTTP session with retries ===
+def _build_session() -> requests.Session:
+    s = requests.Session()
+    retries = Retry(
+        total=RETRY_TOTAL,
+        backoff_factor=RETRY_BACKOFF_FACTOR,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["HEAD", "GET", "OPTIONS", "POST", "PUT", "DELETE"]),
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
 
-def _get_oauth_token() -> str:
+_session = _build_session()
+
+# === Helpers ===
+def _now_epoch() -> int:
+    return int(time.time())
+
+def _to_iso(epoch_seconds: int, tz=timezone.utc) -> str:
+    return datetime.fromtimestamp(epoch_seconds, tz=tz).isoformat()
+
+def _sanitize_merchant_order_id(m: str) -> str:
+    # Allowed: max 63 chars, alnum, underscore, hyphen. Reject otherwise.
+    if not isinstance(m, str):
+        raise ValueError("merchantOrderId must be a string")
+    if len(m) > 63:
+        raise ValueError("merchantOrderId length must be <= 63 characters")
+    if not re.match(r"^[A-Za-z0-9_-]+$", m):
+        raise ValueError("merchantOrderId contains invalid characters; only A-Z a-z 0-9 _ - allowed")
+    return m
+
+def _min_amount_check(amount_paise: int) -> None:
+    if not isinstance(amount_paise, int):
+        raise ValueError("amount_paise must be integer (in paise)")
+    if amount_paise < 100:
+        raise ValueError("amount must be >= 100 paise (₹1)")
+
+# === Token storage helpers (Redis or in-memory) ===
+def _store_token(access_token: str, expires_at: int, issued_at: int, token_type: str = "O-Bearer") -> None:
+    payload = {"access_token": access_token, "expires_at": str(int(expires_at)), "issued_at": str(int(issued_at)), "token_type": token_type}
+    if _redis:
+        try:
+            _redis.hmset("phonepe:token", payload)  # type: ignore[arg-type]
+        except Exception:
+            logger.exception("Failed to write token to Redis; falling back to in-memory store.")
+            _inmemory_token_cache.update({"access_token": access_token, "expires_at": int(expires_at), "issued_at": int(issued_at), "token_type": token_type})
+    else:
+        _inmemory_token_cache.update({"access_token": access_token, "expires_at": int(expires_at), "issued_at": int(issued_at), "token_type": token_type})
+
+def _load_token() -> Dict[str, Any]:
+    if _redis:
+        try:
+            data = _redis.hgetall("phonepe:token") or {}
+            if data:
+                return {
+                    "access_token": data.get("access_token"),
+                    "expires_at": int(data.get("expires_at", "0")),
+                    "issued_at": int(data.get("issued_at", "0")),
+                    "token_type": data.get("token_type", "O-Bearer"),
+                }
+        except Exception:
+            logger.exception("Failed to read token from Redis; reading from in-memory store.")
+    return _inmemory_token_cache.copy()
+
+def _is_token_valid_cached(token_info: Dict[str, Any]) -> bool:
+    token = token_info.get("access_token")
+    expires_at = int(token_info.get("expires_at", 0) or 0)
+    if not token:
+        return False
+    # ensure now + margin < expires_at
+    return (_now_epoch() + TOKEN_REFRESH_MARGIN_SEC) < expires_at
+
+# === Locking for refresh (Redis distributed lock if available) ===
+class _RefreshLock:
+    def __init__(self, name: str = "phonepe:token:lock", ttl: int = 10):
+        self.name = name
+        self.ttl = ttl
+        self._local_lock = threading.Lock()
+
+    def acquire(self, blocking: bool = True) -> bool:
+        if _redis:
+            # use redis lock
+            try:
+                self._rlock = _redis.lock(self.name, timeout=self.ttl)
+                return self._rlock.acquire(blocking=blocking)
+            except Exception:
+                logger.exception("Redis lock failed; using local lock fallback.")
+                return self._local_lock.acquire(blocking)
+        else:
+            return self._local_lock.acquire(blocking)
+
+    def release(self) -> None:
+        if _redis and hasattr(self, "_rlock"):
+            try:
+                self._rlock.release()
+                return
+            except Exception:
+                logger.exception("Failed to release redis lock; releasing local lock fallback.")
+        try:
+            self._local_lock.release()
+        except Exception:
+            pass
+
+_refresh_lock = _RefreshLock()
+
+# === OAuth token fetcher ===
+def _fetch_oauth_from_phonepe() -> Dict[str, Any]:
     """
-    Fetch and cache PhonePe access token. Raises RuntimeError on failure.
+    Call PhonePe OAuth endpoint and return parsed JSON response.
+    Raises RuntimeError on failure.
     """
-    if _is_token_valid():
-        logger.info("Using cached PhonePe token, expires_at=%s", _token_cache.get("expires_at"))
-        return _token_cache["access_token"]
-
-    url = PHONEPE_TOKEN_URL
-    logger.info("Requesting PhonePe OAuth token from %s (env=%s)", url, PHONEPE_ENV)
-
-    client_id = os.getenv("PHONEPE_CLIENT_ID") or PHONEPE_MERCHANT_ID
-    client_version = os.getenv("PHONEPE_CLIENT_VERSION") or PHONEPE_CLIENT_VERSION
+    client_id = PHONEPE_CLIENT_ID or PHONEPE_MERCHANT_ID
     client_secret = PHONEPE_CLIENT_SECRET
+    client_version = PHONEPE_CLIENT_VERSION
 
     if not client_id or not client_secret:
         raise RuntimeError("PhonePe client_id or client_secret missing in environment")
@@ -57,205 +207,258 @@ def _get_oauth_token() -> str:
         "client_id": client_id,
         "client_version": client_version,
         "client_secret": client_secret,
-        "grant_type": "client_credentials"
+        "grant_type": "client_credentials",
     }
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    url = PHONEPE_TOKEN_URL
 
+    logger.info("Requesting PhonePe token from %s", url)
     try:
-        r = requests.post(url, data=payload, headers=headers, timeout=20)
+        resp = _session.post(url, data=payload, headers=headers, timeout=HTTP_TIMEOUT)
     except Exception as e:
-        logger.exception("PhonePe token request failed to connect")
+        logger.exception("PhonePe token request failed")
         raise RuntimeError(f"PhonePe token request failed: {e}")
 
+    if resp.status_code != 200:
+        msg = f"PhonePe token endpoint returned {resp.status_code}: {resp.text[:1000]}"
+        logger.error(msg)
+        raise RuntimeError(msg)
+
     try:
-        j = r.json()
+        j = resp.json()
     except Exception:
-        logger.error("PhonePe token returned non-json: %s", r.text[:1000])
-        raise RuntimeError(f"PhonePe token fetch failed, non-json response: {r.status_code} {r.text}")
+        logger.error("PhonePe token returned non-json: %s", resp.text[:1200])
+        raise RuntimeError(f"PhonePe token fetch failed: non-json response {resp.status_code}")
 
-    token_present = bool(j.get("access_token") or j.get("encrypted_access_token"))
-    token_type = j.get("token_type") or j.get("tokenType") or "O-Bearer"
-    expires_at_value = j.get("expires_at") or j.get("session_expires_at") or j.get("expiresAt") or j.get("expires_in") or 0
+    return j
 
-    logger.info("PhonePe token fetch status=%s token_present=%s token_type=%s expires_at=%s",
-                r.status_code, token_present, token_type, expires_at_value)
+def _parse_and_store_token(resp_json: Dict[str, Any]) -> str:
+    access_token = resp_json.get("access_token") or resp_json.get("encrypted_access_token")
+    token_type = resp_json.get("token_type") or resp_json.get("tokenType") or "O-Bearer"
 
-    if r.status_code != 200 or not token_present:
-        raise RuntimeError(f"PhonePe token fetch failed: {j}")
+    # expires_at may come in multiple forms
+    expires_at = resp_json.get("expires_at") or resp_json.get("session_expires_at") or resp_json.get("expiresAt")
+    issued_at = resp_json.get("issued_at") or resp_json.get("issuedAt") or resp_json.get("issuedAtEpoch") or resp_json.get("issuedAtSeconds")
+    expires_in = resp_json.get("expires_in") or resp_json.get("expiresIn")
 
-    access_token = j.get("access_token") or j.get("encrypted_access_token")
+    # Normalize numeric values
     try:
-        expires_epoch = int(expires_at_value or 0)
+        expires_at_epoch = int(expires_at) if expires_at is not None else 0
     except Exception:
-        expires_epoch = 0
-    if not expires_epoch:
-        expires_epoch = int(time.time()) + 300  # fallback short expiry
+        expires_at_epoch = 0
+    try:
+        issued_at_epoch = int(issued_at) if issued_at is not None else int(time.time())
+    except Exception:
+        issued_at_epoch = int(time.time())
+    try:
+        expires_in_int = int(expires_in) if expires_in is not None else 0
+    except Exception:
+        expires_in_int = 0
 
-    _token_cache["access_token"] = access_token
-    _token_cache["token_type"] = token_type
-    _token_cache["expires_at"] = expires_epoch
+    # If no explicit expires_at, compute from issued_at + expires_in
+    if not expires_at_epoch and expires_in_int:
+        expires_at_epoch = issued_at_epoch + expires_in_int
 
-    logger.info("PhonePe token cached expires_at=%s (epoch)", expires_epoch)
+    # If still not present, fallback to short expiry to force refresh later
+    if not expires_at_epoch:
+        expires_at_epoch = int(time.time()) + 300  # 5 minutes fallback
+
+    if not access_token:
+        logger.error("PhonePe token response missing access_token: %s", resp_json)
+        raise RuntimeError("PhonePe token response missing access token")
+
+    # store token persistently (redis or in-memory)
+    _store_token(access_token=access_token, expires_at=expires_at_epoch, issued_at=issued_at_epoch, token_type=token_type)
+    logger.info("Stored PhonePe token expires_at=%s (iso=%s)", expires_at_epoch, _to_iso(expires_at_epoch))
     return access_token
 
-def create_checkout(merchant_order_id: str, amount_paise: int, booking_id: int, user_id: str) -> Dict[str, Any]:
+def _get_oauth_token() -> str:
     """
-    Primary behaviour:
-      1) Try SDK order endpoint (/checkout/v2/sdk/order) — returns orderId + token (recommended for mobile SDK).
-      2) If that fails (non-200), fallback to web checkout (/checkout/v2/pay) and return redirectUrl.
-    Returns a dict with keys depending on flow:
-      - SDK flow: { "orderId": "...", "token": "...", "state": "CREATED" }
-      - Web flow: { "redirectUrl": "...", ... }
+    Public function to obtain a valid access token.
+    Uses cached token if still valid; otherwise refreshes with lock to avoid races.
+    Raises RuntimeError on irrecoverable failure.
     """
+    # Load token from cache first
+    token_info = _load_token()
+    if _is_token_valid_cached(token_info):
+        logger.debug("Using cached PhonePe token, expires_at=%s", token_info.get("expires_at"))
+        return token_info["access_token"]
+
+    # Acquire refresh lock so only one process/thread refreshes at once
+    got = _refresh_lock.acquire(blocking=True)
+    if not got:
+        # If lock not acquired, re-check cache (another process may have refreshed)
+        token_info = _load_token()
+        if _is_token_valid_cached(token_info):
+            return token_info["access_token"]
+        raise RuntimeError("Failed to acquire token refresh lock")
+
+    try:
+        # After acquiring, re-check (double-check pattern)
+        token_info = _load_token()
+        if _is_token_valid_cached(token_info):
+            return token_info["access_token"]
+
+        # Fetch from PhonePe
+        resp_json = _fetch_oauth_from_phonepe()
+        return _parse_and_store_token(resp_json)
+    finally:
+        _refresh_lock.release()
+
+# === API helpers ===
+def _build_headers(add_x_auth_token: bool = False) -> Dict[str, str]:
     token = _get_oauth_token()
-    token_type = _token_cache.get("token_type") or "O-Bearer"
-
-    # common body for order creation (SDK)
-    sdk_body = {
-        "merchantOrderId": merchant_order_id,
-        "amount": amount_paise,
-        "metaInfo": {"udf1": str(booking_id), "udf2": str(user_id)},
-        "paymentFlow": {"type": "PG_CHECKOUT"}
-    }
-
+    token_info = _load_token()
+    token_type = token_info.get("token_type") or "O-Bearer"
     headers = {
         "Content-Type": "application/json",
-        # docs show Authorization: O-Bearer <token>
-        "Authorization": f"O-Bearer {token}",
+        "Authorization": f"{token_type} {token}",
     }
-    # include merchant header if available
+    # Only add X-MERCHANT-ID if configured
     if PHONEPE_MERCHANT_ID:
         headers["X-MERCHANT-ID"] = PHONEPE_MERCHANT_ID
+    # The legacy code set x-auth-token; PhonePe docs don't require it. Provide an opt-in env var.
+    if add_x_auth_token := (os.getenv("PHONEPE_ADD_X_AUTH_TOKEN", "false").lower() == "true"):
+        headers["x-auth-token"] = token
+    return headers
 
-    # 1) Try SDK order endpoint (production: /checkout/v2/sdk/order)
-    sdk_url = PHONEPE_CHECKOUT_BASE.rstrip("/") + "/checkout/v2/sdk/order"
-    logger.info("Attempting PhonePe SDK order create: %s", sdk_url)
-    try:
-        r = requests.post(sdk_url, json=sdk_body, headers=headers, timeout=20)
-        snippet = (r.text[:1200] + "...") if len(r.text) > 1200 else r.text
-        logger.info("PhonePe SDK order status=%s snippet=%s", r.status_code, snippet)
-        try:
-            j = r.json()
-        except Exception:
-            j = None
+def create_order(
+    merchant_order_id: str,
+    amount_paise: int,
+    expire_after: Optional[int] = None,
+    meta_info: Optional[Dict[str, Any]] = None,
+    payment_flow_type: str = "PG_CHECKOUT",
+) -> Dict[str, Any]:
+    """
+    Create PhonePe order token (checkout).
+    Returns PhonePe JSON response.
+    """
+    merchant_order_id = _sanitize_merchant_order_id(merchant_order_id)
+    _min_amount_check(amount_paise)
+    if meta_info is None:
+        meta_info = {}
 
-        if r.status_code in (200, 201) and j:
-            # expected keys: orderId and token
-            if j.get("orderId") and j.get("token") is not None:
-                logger.info("PhonePe SDK order created orderId=%s", j.get("orderId"))
-                return j
-            # sometimes token may be under data
-            maybe = j.get("data") or {}
-            if maybe.get("orderId") and maybe.get("token"):
-                logger.info("PhonePe SDK order created (nested) orderId=%s", maybe.get("orderId"))
-                return maybe
-        else:
-            # log error and fall through to fallback
-            logger.warning("PhonePe SDK order create did not succeed (status=%s) - falling back to web checkout", r.status_code)
-            # continue to fallback
-    except Exception as e:
-        logger.exception("PhonePe SDK order request failed; falling back to web checkout: %s", e)
-
-    # 2) Fallback: web checkout (/checkout/v2/pay) — returns redirectUrl for browser-based flow
-    web_body = {
+    # Build request body
+    body: Dict[str, Any] = {
         "merchantOrderId": merchant_order_id,
         "amount": amount_paise,
-        "paymentFlow": {
-            "type": "PG_CHECKOUT",
-            "merchantUrls": {"redirectUrl": PHONEPE_REDIRECT_URL or ""}
-        },
-        "metaInfo": {"udf1": str(booking_id), "udf2": str(user_id)}
+        "paymentFlow": {"type": payment_flow_type},
     }
+    if expire_after:
+        body["expireAfter"] = int(expire_after)
+    if PHONEPE_REDIRECT_URL:
+        # merchantUrls redirect if available
+        body.setdefault("paymentFlow", {})  # ensure exists
+        # merge into existing paymentFlow if they passed custom type
+        body["paymentFlow"].setdefault("merchantUrls", {})["redirectUrl"] = PHONEPE_REDIRECT_URL
+    if meta_info:
+        body["metaInfo"] = meta_info
 
-    web_url = PHONEPE_CHECKOUT_BASE.rstrip("/") + "/checkout/v2/pay"
-    logger.info("Attempting PhonePe web checkout create: %s", web_url)
+    url = PHONEPE_CHECKOUT_BASE.rstrip("/") + "/checkout/v2/sdk/order"
+    headers = _build_headers()
+
+    logger.info("Creating PhonePe order merchantOrderId=%s amount=%s url=%s", merchant_order_id, amount_paise, url)
     try:
-        r2 = requests.post(web_url, json=web_body, headers=headers, timeout=20)
+        resp = _session.post(url, json=body, headers=headers, timeout=HTTP_TIMEOUT)
     except Exception as e:
-        logger.exception("PhonePe web checkout request failed")
-        raise RuntimeError(f"PhonePe checkout request failed: {e}")
-
-    snippet2 = (r2.text[:1200] + "...") if len(r2.text) > 1200 else r2.text
-    logger.info("PhonePe web checkout status=%s body_snippet=%s", r2.status_code, snippet2)
+        logger.exception("PhonePe create_order request failed")
+        raise RuntimeError(f"PhonePe create_order request failed: {e}")
 
     try:
-        j2 = r2.json()
+        j = resp.json()
     except Exception:
-        raise RuntimeError(f"PhonePe checkout returned non-json: {r2.status_code} {r2.text}")
+        logger.error("PhonePe create_order: non-json response: %s", resp.text[:1000])
+        raise RuntimeError(f"PhonePe create_order returned non-json: {resp.status_code}")
 
-    if r2.status_code not in (200, 201):
-        # bubble up PhonePe JSON so caller can log it
-        raise RuntimeError(f"PhonePe checkout error {r2.status_code}: {j2}")
+    if resp.status_code not in (200, 201):
+        logger.error("PhonePe create_order error status=%s body=%s", resp.status_code, j)
+        raise RuntimeError(f"PhonePe create_order error {resp.status_code}: {j}")
 
-    return j2
+    # Response expected keys: orderId, state, expireAt, token
+    return j
 
-# Optional helpers (order status & refund can be added the same way)
 def order_status(merchant_order_id: str, details: bool = False, error_context: bool = False, merchant_id: Optional[str] = None) -> Dict[str, Any]:
-    token = _get_oauth_token()
-    token_type = _token_cache.get("token_type") or "O-Bearer"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"O-Bearer {token}"
-    }
-    if merchant_id:
-        headers["X-MERCHANT-ID"] = merchant_id
-    elif PHONEPE_MERCHANT_ID:
-        headers["X-MERCHANT-ID"] = PHONEPE_MERCHANT_ID
-
+    merchant_order_id = _sanitize_merchant_order_id(merchant_order_id)
     params = {"details": "true" if details else "false", "errorContext": "true" if error_context else "false"}
     url = PHONEPE_CHECKOUT_BASE.rstrip("/") + f"/checkout/v2/order/{merchant_order_id}/status"
-    r = requests.get(url, headers=headers, params=params, timeout=20)
+    headers = _build_headers()
+    if merchant_id:
+        headers["X-MERCHANT-ID"] = merchant_id
+    logger.info("PhonePe order_status merchantOrderId=%s", merchant_order_id)
+    resp = _session.get(url, headers=headers, params=params, timeout=HTTP_TIMEOUT)
     try:
-        j = r.json()
+        j = resp.json()
     except Exception:
-        raise RuntimeError(f"PhonePe order status returned non-json: {r.status_code} {r.text}")
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"PhonePe order status error {r.status_code}: {j}")
+        logger.error("PhonePe order_status returned non-json: %s", resp.text[:1000])
+        raise RuntimeError(f"PhonePe order_status returned non-json: {resp.status_code}")
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(f"PhonePe order_status error {resp.status_code}: {j}")
     return j
 
 def initiate_refund(merchant_refund_id: str, original_merchant_order_id: str, amount_paise: int, merchant_id: Optional[str] = None) -> Dict[str, Any]:
-    token = _get_oauth_token()
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"O-Bearer {token}"
+    if not isinstance(merchant_refund_id, str) or len(merchant_refund_id) > 63:
+        raise ValueError("merchant_refund_id must be string and <= 63 chars")
+    _min_amount_check(amount_paise)
+    url = PHONEPE_CHECKOUT_BASE.rstrip("/") + "/payments/v2/refund"
+    body = {
+        "merchantRefundId": merchant_refund_id,
+        "originalMerchantOrderId": original_merchant_order_id,
+        "amount": amount_paise,
     }
+    headers = _build_headers()
     if merchant_id:
         headers["X-MERCHANT-ID"] = merchant_id
-    elif PHONEPE_MERCHANT_ID:
-        headers["X-MERCHANT-ID"] = PHONEPE_MERCHANT_ID
-
-    url = PHONEPE_CHECKOUT_BASE.rstrip("/") + "/payments/v2/refund"
-    body = {"merchantRefundId": merchant_refund_id, "originalMerchantOrderId": original_merchant_order_id, "amount": amount_paise}
-    r = requests.post(url, json=body, headers=headers, timeout=20)
+    logger.info("PhonePe initiate_refund merchantRefundId=%s originalOrder=%s amount=%s", merchant_refund_id, original_merchant_order_id, amount_paise)
+    resp = _session.post(url, headers=headers, json=body, timeout=HTTP_TIMEOUT)
     try:
-        j = r.json()
+        j = resp.json()
     except Exception:
-        raise RuntimeError(f"PhonePe refund returned non-json: {r.status_code} {r.text}")
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"PhonePe refund error {r.status_code}: {j}")
+        logger.error("PhonePe refund returned non-json: %s", resp.text[:1000])
+        raise RuntimeError(f"PhonePe refund returned non-json: {resp.status_code}")
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(f"PhonePe refund error {resp.status_code}: {j}")
     return j
 
 def refund_status(merchant_refund_id: str, merchant_id: Optional[str] = None) -> Dict[str, Any]:
-    token = _get_oauth_token()
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"O-Bearer {token}"
-    }
+    if not isinstance(merchant_refund_id, str) or len(merchant_refund_id) > 63:
+        raise ValueError("merchant_refund_id must be string and <= 63 chars")
+    url = PHONEPE_CHECKOUT_BASE.rstrip("/") + f"/payments/v2/refund/{merchant_refund_id}/status"
+    headers = _build_headers()
     if merchant_id:
         headers["X-MERCHANT-ID"] = merchant_id
-    elif PHONEPE_MERCHANT_ID:
-        headers["X-MERCHANT-ID"] = PHONEPE_MERCHANT_ID
-
-    url = PHONEPE_CHECKOUT_BASE.rstrip("/") + f"/payments/v2/refund/{merchant_refund_id}/status"
-    r = requests.get(url, headers=headers, timeout=20)
+    logger.info("PhonePe refund_status merchantRefundId=%s", merchant_refund_id)
+    resp = _session.get(url, headers=headers, timeout=HTTP_TIMEOUT)
     try:
-        j = r.json()
+        j = resp.json()
     except Exception:
-        raise RuntimeError(f"PhonePe refund status returned non-json: {r.status_code} {r.text}")
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"PhonePe refund status error {r.status_code}: {j}")
+        logger.error("PhonePe refund_status returned non-json: %s", resp.text[:1000])
+        raise RuntimeError(f"PhonePe refund_status returned non-json: {resp.status_code}")
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(f"PhonePe refund_status error {resp.status_code}: {j}")
     return j
 
+# === Diagnostic use ===
+def token_info() -> Dict[str, Any]:
+    t = _load_token()
+    info = {
+        "has_token": bool(t.get("access_token")),
+        "expires_at": t.get("expires_at"),
+        "expires_at_iso": _to_iso(int(t["expires_at"])) if t.get("expires_at") else None,
+        "issued_at": t.get("issued_at"),
+    }
+    return info
+
+# === Usage example (do not run at import-time in production) ===
+if __name__ == "__main__":  # quick local test
+    logging.basicConfig(level=logging.DEBUG)
+    # Basic test flow, only run locally after setting env vars
+    try:
+        print("Token info before fetch:", token_info())
+        tok = _get_oauth_token()
+        print("Fetched token (truncated):", tok[:16] + "..." if tok else None)
+        print("Token info after fetch:", token_info())
+    except Exception as e:
+        logger.exception("Local test failed: %s", e)
 
 
 
