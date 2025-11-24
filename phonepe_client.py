@@ -127,6 +127,10 @@ def create_checkout(merchant_order_id: str, amount_paise: int, booking_id: int, 
     if PHONEPE_MERCHANT_ID:
         headers["X-MERCHANT-ID"] = PHONEPE_MERCHANT_ID
 
+    # TEMP TEST: force Authorization to "Bearer" to test token format issues
+    # Remove this line after testing (or keep if PhonePe accepts Bearer and it fixes the 401).
+    headers["Authorization"] = f"Bearer {token}"
+
     # Log non-sensitive header info for debugging
     logger.info("PhonePe checkout headers: X-MERCHANT-ID=%s, Authorization_type=%s", PHONEPE_MERCHANT_ID, token_type)
 
