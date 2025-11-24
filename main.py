@@ -1,4 +1,4 @@
-# main.py
+## main.py
 import os
 from pathlib import Path
 import logging
@@ -29,7 +29,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from supabase import create_client, Client
 
-# password hashing for signup/login
+# password hashing for signup/login - use bcrypt_sha256 to avoid 72-byte limit
 from passlib.context import CryptContext
 
 # local phonepe helper (import after env loaded)
@@ -79,7 +79,8 @@ async def add_security_headers(request: Request, call_next):
 # -----------------------
 # Password hashing
 # -----------------------
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# Use bcrypt_sha256 to avoid bcrypt's 72-byte limit
+pwd_context = CryptContext(schemes=["bcrypt_sha256"], deprecated="auto")
 
 # ======================
 # Schemas
@@ -141,8 +142,6 @@ def verify_phonepe_signature(raw_body: bytes, signature_header: str | None) -> b
     *This is an example only.* Please consult PhonePe docs for the exact
     header name and algorithm (they might use base64-encoded HMAC or RSA).
     Update this function to match the production spec provided by PhonePe.*
-
-    Expected header name used below: X-PHONEPE-SIGNATURE
     """
     secret = os.getenv("PHONEPE_CLIENT_SECRET")
     if not secret:
@@ -487,6 +486,85 @@ def order_status(merchant_order_id: str):
         "transaction_id": order.get("phonepe_order_id"),
         "amount": order.get("amount")
     }
+
+# --- Diagnostic endpoints (temporary) ---
+
+
+DIAG_ENV_VAR = "DIAG_SECRET"  # set this env var on Render to a secret value
+
+def _check_diag_key(x_diag: str | None):
+    # simple header-based auth so only you can hit these endpoints
+    import os
+    expected = os.getenv(DIAG_ENV_VAR)
+    if not expected:
+        # if DIAG_SECRET is not set, refuse to run diagnostics
+        raise HTTPException(status_code=403, detail="Diag disabled (no DIAG_SECRET set)")
+    if x_diag != expected:
+        raise HTTPException(status_code=401, detail="Invalid diag secret")
+    return True
+
+@app.get("/diag/packages")
+def diag_packages(x_diag: str | None = Header(None)):
+    _check_diag_key(x_diag)
+    # report installed versions for key packages
+    out = {}
+    try:
+        import pkg_resources
+        for pkg in ("passlib", "bcrypt", "requests"):
+            try:
+                v = pkg_resources.get_distribution(pkg).version
+            except Exception:
+                v = None
+            out[pkg] = v
+    except Exception:
+        out["error"] = "pkg_resources unavailable"
+    return out
+
+@app.get("/diag/bcrypt")
+def diag_bcrypt(x_diag: str | None = Header(None)):
+    _check_diag_key(x_diag)
+    # attempt to import bcrypt and report the module file path (not the content)
+    try:
+        import bcrypt as _bcrypt
+        path = getattr(_bcrypt, "__file__", None)
+        return {"bcrypt_file": path}
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/diag/phonepe-token-check")
+def diag_phonepe_token(x_diag: str | None = Header(None)):
+    _check_diag_key(x_diag)
+    """
+    Attempt a token fetch from PHONEPE_TOKEN_URL using configured env vars.
+    DOES NOT return token values. Returns status code and keys present in JSON.
+    """
+    import os, requests
+    token_url = os.getenv("PHONEPE_TOKEN_URL")
+    client_id = os.getenv("PHONEPE_CLIENT_ID") or os.getenv("PHONEPE_MERCHANT_ID")
+    client_secret = bool(os.getenv("PHONEPE_CLIENT_SECRET"))  # boolean only
+    if not token_url:
+        return {"error": "PHONEPE_TOKEN_URL not set in env"}
+    if not client_id:
+        return {"error": "PHONEPE_CLIENT_ID / PHONEPE_MERCHANT_ID missing"}
+    # perform request, but do not include client_secret in log or return
+    try:
+        resp = requests.post(token_url, data={
+            "client_id": client_id,
+            "client_secret": os.getenv("PHONEPE_CLIENT_SECRET") or "",
+            "client_version": os.getenv("PHONEPE_CLIENT_VERSION","1"),
+            "grant_type": "client_credentials"
+        }, timeout=15)
+    except Exception as e:
+        return {"error": f"token request failed: {str(e)}"}
+    # parse body keys if JSON
+    try:
+        j = resp.json()
+        keys = list(j.keys())
+    except Exception:
+        keys = None
+    return {"status_code": resp.status_code, "json_keys": keys}
+# --- end diagnostics ---
+
 
 
 
