@@ -1,4 +1,3 @@
-# phonepe_client.py
 import os
 import time
 import requests
@@ -101,13 +100,64 @@ def _get_oauth_token() -> str:
 
 def create_checkout(merchant_order_id: str, amount_paise: int, booking_id: int, user_id: str) -> Dict[str, Any]:
     """
-    Create PhonePe checkout session (POST /checkout/v2/pay).
-    Returns parsed JSON response or raises RuntimeError on failure.
+    Primary behaviour:
+      1) Try SDK order endpoint (/checkout/v2/sdk/order) — returns orderId + token (recommended for mobile SDK).
+      2) If that fails (non-200), fallback to web checkout (/checkout/v2/pay) and return redirectUrl.
+    Returns a dict with keys depending on flow:
+      - SDK flow: { "orderId": "...", "token": "...", "state": "CREATED" }
+      - Web flow: { "redirectUrl": "...", ... }
     """
     token = _get_oauth_token()
     token_type = _token_cache.get("token_type") or "O-Bearer"
 
-    body = {
+    # common body for order creation (SDK)
+    sdk_body = {
+        "merchantOrderId": merchant_order_id,
+        "amount": amount_paise,
+        "metaInfo": {"udf1": str(booking_id), "udf2": str(user_id)},
+        "paymentFlow": {"type": "PG_CHECKOUT"}
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        # docs show Authorization: O-Bearer <token>
+        "Authorization": f"O-Bearer {token}",
+    }
+    # include merchant header if available
+    if PHONEPE_MERCHANT_ID:
+        headers["X-MERCHANT-ID"] = PHONEPE_MERCHANT_ID
+
+    # 1) Try SDK order endpoint (production: /checkout/v2/sdk/order)
+    sdk_url = PHONEPE_CHECKOUT_BASE.rstrip("/") + "/checkout/v2/sdk/order"
+    logger.info("Attempting PhonePe SDK order create: %s", sdk_url)
+    try:
+        r = requests.post(sdk_url, json=sdk_body, headers=headers, timeout=20)
+        snippet = (r.text[:1200] + "...") if len(r.text) > 1200 else r.text
+        logger.info("PhonePe SDK order status=%s snippet=%s", r.status_code, snippet)
+        try:
+            j = r.json()
+        except Exception:
+            j = None
+
+        if r.status_code in (200, 201) and j:
+            # expected keys: orderId and token
+            if j.get("orderId") and j.get("token") is not None:
+                logger.info("PhonePe SDK order created orderId=%s", j.get("orderId"))
+                return j
+            # sometimes token may be under data
+            maybe = j.get("data") or {}
+            if maybe.get("orderId") and maybe.get("token"):
+                logger.info("PhonePe SDK order created (nested) orderId=%s", maybe.get("orderId"))
+                return maybe
+        else:
+            # log error and fall through to fallback
+            logger.warning("PhonePe SDK order create did not succeed (status=%s) - falling back to web checkout", r.status_code)
+            # continue to fallback
+    except Exception as e:
+        logger.exception("PhonePe SDK order request failed; falling back to web checkout: %s", e)
+
+    # 2) Fallback: web checkout (/checkout/v2/pay) — returns redirectUrl for browser-based flow
+    web_body = {
         "merchantOrderId": merchant_order_id,
         "amount": amount_paise,
         "paymentFlow": {
@@ -117,45 +167,27 @@ def create_checkout(merchant_order_id: str, amount_paise: int, booking_id: int, 
         "metaInfo": {"udf1": str(booking_id), "udf2": str(user_id)}
     }
 
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"{token_type} {token}",
-        "x-auth-token": token
-    }
-
-    # Ensure merchant id header present if configured
-    if PHONEPE_MERCHANT_ID:
-        headers["X-MERCHANT-ID"] = PHONEPE_MERCHANT_ID
-
-    # TEMP TEST: force Authorization to "Bearer" to test token format issues
-    # Remove this line after testing (or keep if PhonePe accepts Bearer and it fixes the 401).
-    headers["Authorization"] = f"Bearer {token}"
-
-    # Log non-sensitive header info for debugging
-    logger.info("PhonePe checkout headers: X-MERCHANT-ID=%s, Authorization_type=%s", PHONEPE_MERCHANT_ID, token_type)
-
-    url = PHONEPE_CHECKOUT_BASE.rstrip("/") + "/checkout/v2/pay"
-    logger.info("Calling PhonePe checkout create: %s merchantOrderId=%s amount=%s", url, merchant_order_id, amount_paise)
-
+    web_url = PHONEPE_CHECKOUT_BASE.rstrip("/") + "/checkout/v2/pay"
+    logger.info("Attempting PhonePe web checkout create: %s", web_url)
     try:
-        r = requests.post(url, json=body, headers=headers, timeout=20)
+        r2 = requests.post(web_url, json=web_body, headers=headers, timeout=20)
     except Exception as e:
-        logger.exception("PhonePe checkout request failed")
+        logger.exception("PhonePe web checkout request failed")
         raise RuntimeError(f"PhonePe checkout request failed: {e}")
 
-    snippet = (r.text[:1200] + "...") if len(r.text) > 1200 else r.text
-    logger.info("PhonePe checkout status=%s body_snippet=%s", r.status_code, snippet)
+    snippet2 = (r2.text[:1200] + "...") if len(r2.text) > 1200 else r2.text
+    logger.info("PhonePe web checkout status=%s body_snippet=%s", r2.status_code, snippet2)
 
     try:
-        j = r.json()
+        j2 = r2.json()
     except Exception:
-        raise RuntimeError(f"PhonePe checkout returned non-json: {r.status_code} {r.text}")
+        raise RuntimeError(f"PhonePe checkout returned non-json: {r2.status_code} {r2.text}")
 
-    if r.status_code not in (200, 201):
+    if r2.status_code not in (200, 201):
         # bubble up PhonePe JSON so caller can log it
-        raise RuntimeError(f"PhonePe checkout error {r.status_code}: {j}")
+        raise RuntimeError(f"PhonePe checkout error {r2.status_code}: {j2}")
 
-    return j
+    return j2
 
 # Optional helpers (order status & refund can be added the same way)
 def order_status(merchant_order_id: str, details: bool = False, error_context: bool = False, merchant_id: Optional[str] = None) -> Dict[str, Any]:
@@ -163,8 +195,7 @@ def order_status(merchant_order_id: str, details: bool = False, error_context: b
     token_type = _token_cache.get("token_type") or "O-Bearer"
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"{token_type} {token}",
-        "x-auth-token": token
+        "Authorization": f"O-Bearer {token}"
     }
     if merchant_id:
         headers["X-MERCHANT-ID"] = merchant_id
@@ -184,11 +215,9 @@ def order_status(merchant_order_id: str, details: bool = False, error_context: b
 
 def initiate_refund(merchant_refund_id: str, original_merchant_order_id: str, amount_paise: int, merchant_id: Optional[str] = None) -> Dict[str, Any]:
     token = _get_oauth_token()
-    token_type = _token_cache.get("token_type") or "O-Bearer"
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"{token_type} {token}",
-        "x-auth-token": token
+        "Authorization": f"O-Bearer {token}"
     }
     if merchant_id:
         headers["X-MERCHANT-ID"] = merchant_id
@@ -208,11 +237,9 @@ def initiate_refund(merchant_refund_id: str, original_merchant_order_id: str, am
 
 def refund_status(merchant_refund_id: str, merchant_id: Optional[str] = None) -> Dict[str, Any]:
     token = _get_oauth_token()
-    token_type = _token_cache.get("token_type") or "O-Bearer"
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"{token_type} {token}",
-        "x-auth-token": token
+        "Authorization": f"O-Bearer {token}"
     }
     if merchant_id:
         headers["X-MERCHANT-ID"] = merchant_id
@@ -228,6 +255,7 @@ def refund_status(merchant_refund_id: str, merchant_id: Optional[str] = None) ->
     if r.status_code not in (200, 201):
         raise RuntimeError(f"PhonePe refund status error {r.status_code}: {j}")
     return j
+
 
 
 
