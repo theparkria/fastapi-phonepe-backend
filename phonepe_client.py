@@ -1,3 +1,4 @@
+# phonepe_client.py
 import os
 import time
 import requests
@@ -30,13 +31,10 @@ if not PHONEPE_MERCHANT_ID or not PHONEPE_CLIENT_SECRET:
 # Token cache
 _token_cache: Dict[str, Any] = {"access_token": None, "token_type": None, "expires_at": 0}
 
-
 def _is_token_valid() -> bool:
     at = _token_cache.get("access_token")
     exp = _token_cache.get("expires_at", 0)
-    # add small safety margin
-    return bool(at) and (time.time() + 10) < exp
-
+    return bool(at) and (time.time() + 5) < exp
 
 def _get_oauth_token() -> str:
     """
@@ -56,7 +54,6 @@ def _get_oauth_token() -> str:
     if not client_id or not client_secret:
         raise RuntimeError("PhonePe client_id or client_secret missing in environment")
 
-    # PhonePe expects form-encoded client credentials for certain endpoints
     payload = {
         "client_id": client_id,
         "client_version": client_version,
@@ -77,31 +74,23 @@ def _get_oauth_token() -> str:
         logger.error("PhonePe token returned non-json: %s", r.text[:1000])
         raise RuntimeError(f"PhonePe token fetch failed, non-json response: {r.status_code} {r.text}")
 
-    # Normalize token fields across possible shapes
-    access_token = j.get("access_token") or j.get("encrypted_access_token")
-    token_type = j.get("token_type") or j.get("tokenType") or j.get("token_type") or "O-Bearer"
-    # PhonePe may return expires_in or expiresAt; prefer expires_in (seconds)
-    expires_in = j.get("expires_in") or j.get("expiresIn")
-    expires_at_value = j.get("expires_at") or j.get("session_expires_at") or j.get("expiresAt")
+    token_present = bool(j.get("access_token") or j.get("encrypted_access_token"))
+    token_type = j.get("token_type") or j.get("tokenType") or "O-Bearer"
+    expires_at_value = j.get("expires_at") or j.get("session_expires_at") or j.get("expiresAt") or j.get("expires_in") or 0
 
-    token_present = bool(access_token)
-    logger.info("PhonePe token fetch status=%s token_present=%s token_type=%s expires_in=%s expires_at=%s",
-                r.status_code, token_present, token_type, expires_in, expires_at_value)
+    logger.info("PhonePe token fetch status=%s token_present=%s token_type=%s expires_at=%s",
+                r.status_code, token_present, token_type, expires_at_value)
 
     if r.status_code != 200 or not token_present:
         raise RuntimeError(f"PhonePe token fetch failed: {j}")
 
-    # Compute expiry epoch
+    access_token = j.get("access_token") or j.get("encrypted_access_token")
     try:
-        if expires_in:
-            expires_epoch = int(time.time()) + int(expires_in)
-        elif expires_at_value:
-            # if value is epoch seconds, use directly; otherwise fallback
-            expires_epoch = int(expires_at_value)
-        else:
-            expires_epoch = int(time.time()) + 300  # fallback 5 minutes
+        expires_epoch = int(expires_at_value or 0)
     except Exception:
-        expires_epoch = int(time.time()) + 300
+        expires_epoch = 0
+    if not expires_epoch:
+        expires_epoch = int(time.time()) + 300  # fallback short expiry
 
     _token_cache["access_token"] = access_token
     _token_cache["token_type"] = token_type
@@ -109,7 +98,6 @@ def _get_oauth_token() -> str:
 
     logger.info("PhonePe token cached expires_at=%s (epoch)", expires_epoch)
     return access_token
-
 
 def create_checkout(merchant_order_id: str, amount_paise: int, booking_id: int, user_id: str) -> Dict[str, Any]:
     """
@@ -135,9 +123,12 @@ def create_checkout(merchant_order_id: str, amount_paise: int, booking_id: int, 
         "x-auth-token": token
     }
 
-    # Add merchant id header if configured (some PhonePe endpoints require X-MERCHANT-ID)
+    # Ensure merchant id header present if configured
     if PHONEPE_MERCHANT_ID:
         headers["X-MERCHANT-ID"] = PHONEPE_MERCHANT_ID
+
+    # Log non-sensitive header info for debugging
+    logger.info("PhonePe checkout headers: X-MERCHANT-ID=%s, Authorization_type=%s", PHONEPE_MERCHANT_ID, token_type)
 
     url = PHONEPE_CHECKOUT_BASE.rstrip("/") + "/checkout/v2/pay"
     logger.info("Calling PhonePe checkout create: %s merchantOrderId=%s amount=%s", url, merchant_order_id, amount_paise)
@@ -161,7 +152,6 @@ def create_checkout(merchant_order_id: str, amount_paise: int, booking_id: int, 
         raise RuntimeError(f"PhonePe checkout error {r.status_code}: {j}")
 
     return j
-
 
 # Optional helpers (order status & refund can be added the same way)
 def order_status(merchant_order_id: str, details: bool = False, error_context: bool = False, merchant_id: Optional[str] = None) -> Dict[str, Any]:
@@ -188,7 +178,6 @@ def order_status(merchant_order_id: str, details: bool = False, error_context: b
         raise RuntimeError(f"PhonePe order status error {r.status_code}: {j}")
     return j
 
-
 def initiate_refund(merchant_refund_id: str, original_merchant_order_id: str, amount_paise: int, merchant_id: Optional[str] = None) -> Dict[str, Any]:
     token = _get_oauth_token()
     token_type = _token_cache.get("token_type") or "O-Bearer"
@@ -212,7 +201,6 @@ def initiate_refund(merchant_refund_id: str, original_merchant_order_id: str, am
     if r.status_code not in (200, 201):
         raise RuntimeError(f"PhonePe refund error {r.status_code}: {j}")
     return j
-
 
 def refund_status(merchant_refund_id: str, merchant_id: Optional[str] = None) -> Dict[str, Any]:
     token = _get_oauth_token()
