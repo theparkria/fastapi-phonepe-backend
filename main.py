@@ -1,4 +1,3 @@
-# main.py
 import os
 from pathlib import Path
 import logging
@@ -6,14 +5,19 @@ import hmac
 import hashlib
 from datetime import datetime
 
-# load dotenv explicitly before importing modules that read env
 from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request, Query, Header, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel
+from supabase import create_client, Client
+from passlib.context import CryptContext
 
-# ensure .env located next to this file is loaded (robust even if working dir differs)
+from phonepe_client import create_order, order_status as phonepe_order_status, token_info as phonepe_token_info
+
 env_path = Path(__file__).resolve().parent / ".env"
 load_dotenv(env_path)
 
-# safe boolean checks only (DO NOT print secret values)
 logger = logging.getLogger("uvicorn.error")
 logger.setLevel(logging.INFO)
 logger.info("ENV CHECK - SUPABASE_URL present: %s", bool(os.getenv("SUPABASE_URL")))
@@ -22,23 +26,6 @@ logger.info("ENV CHECK - PHONEPE_MERCHANT_ID present: %s", bool(os.getenv("PHONE
 logger.info("ENV CHECK - PHONEPE_CLIENT_SECRET present: %s", bool(os.getenv("PHONEPE_CLIENT_SECRET")))
 logger.info("ENV CHECK - PHONEPE_ENV present: %s", bool(os.getenv("PHONEPE_ENV")))
 
-# now safe to import app dependencies that may read env
-from fastapi import FastAPI, HTTPException, Request, Query, Header, Response
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel
-from supabase import create_client, Client
-
-# password hashing for signup/login - use bcrypt_sha256 to avoid 72-byte limit
-from passlib.context import CryptContext
-
-# phonepe_client (production-ready)
-# make sure phonepe_client.py from the improved version is present in the project
-from phonepe_client import create_order, order_status as phonepe_order_status, token_info as phonepe_token_info
-
-# -----------------------
-# Supabase client
-# -----------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
@@ -46,43 +33,24 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
-# -----------------------
-# FastAPI
-# -----------------------
 app = FastAPI(title="Parkria Backend - PhonePe")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # restrict in production to your frontend origin(s)
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -----------------------
-# Security headers middleware required by PhonePe
-# -----------------------
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
-    """
-    Adds the response headers PhonePe requires:
-      - Referrer-Policy: strict-origin-when-cross-origin
-      - Cross-Origin-Opener-Policy: same-origin
-    Set them at the app level so they are present on /payment-success and other responses.
-    """
     response: Response = await call_next(request)
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
     return response
 
-# -----------------------
-# Password hashing
-# -----------------------
-# Use bcrypt_sha256 to avoid bcrypt's 72-byte limit
 pwd_context = CryptContext(schemes=["bcrypt_sha256"], deprecated="auto")
 
-# ======================
-# Schemas
-# ======================
 class SendOTPRequest(BaseModel):
     phone: str
 
@@ -126,18 +94,7 @@ class PaymentRequest(BaseModel):
     amount: int
     user_id: str
 
-# ======================
-# Helpers: signature verification (stub)
-# ======================
 def verify_phonepe_signature(raw_body: bytes, signature_header: str | None) -> bool:
-    """
-    Verify incoming PhonePe callback signature.
-
-    NOTE: PhonePe may use base64-encoded HMAC or other signature formats.
-    This stub assumes hex-encoded HMAC-SHA256 of the raw request body using
-    PHONEPE_CLIENT_SECRET as key. Update this to match the PhonePe spec
-    used by your integration (base64 vs hex, header name, algorithm).
-    """
     secret = os.getenv("PHONEPE_CLIENT_SECRET")
     if not secret:
         logger.warning("PHONEPE_CLIENT_SECRET not configured; skipping signature verification (unsafe!).")
@@ -148,23 +105,16 @@ def verify_phonepe_signature(raw_body: bytes, signature_header: str | None) -> b
         return False
 
     try:
-        # compute hmac sha256 hex digest
         computed = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
         return hmac.compare_digest(computed.lower(), signature_header.lower())
     except Exception as e:
         logger.exception("Failed verifying signature: %s", e)
         return False
 
-# ======================
-# Root
-# ======================
 @app.get("/")
 def root():
     return {"message": "🚀 API Running"}
 
-# ======================
-# Auth & other APIs (unchanged)
-# ======================
 @app.post("/send-otp")
 def send_otp(data: SendOTPRequest):
     return {"message": f"OTP sent to +91{data.phone}", "otp": "1234"}
@@ -192,9 +142,8 @@ def login(user: UserLogin):
     db_user = res.data[0]
     if not pwd_context.verify(user.password, db_user["password_hash"]):
         raise HTTPException(status_code=401, detail="Incorrect password")
-    return {"message": f"Welcome {db_user.get('name')}", "user": {k:v for k,v in db_user.items() if k!="password_hash"}}
+    return {"message": f"Welcome {db_user.get('name')}", "user": {k: v for k, v in db_user.items() if k != "password_hash"}}
 
-# vehicles, services, tokens, parking slots etc...
 @app.post("/vehicles/add")
 def add_vehicle(data: AddVehicleRequest):
     exists = supabase.table("vehicles").select("*").eq("car_number", data.car_number).execute()
@@ -283,7 +232,7 @@ def get_user_tokens(user_id: str = Query(...), service_type_id: int = Query(...)
 @app.get("/parking-slots")
 def get_parking_slots(unit_id: int = Query(...)):
     slots_data = supabase.table("parking_slots").select("*").eq("unit_id", unit_id).execute().data
-    total_slots = 30  # fallback, or fetch from DB
+    total_slots = 30
     return {
         "total_slots": total_slots,
         "slots": slots_data or []
@@ -302,12 +251,8 @@ def book_slot(data: ParkingSlotBookRequest):
     }).eq("slot_id", data.slot_id).execute()
     return {"message": "Slot booked", "slot": res.data[0]}
 
-# ======================
-# Orders / PhonePe integration
-# ======================
 @app.post("/create-payment")
 def create_payment(req: PaymentRequest):
-    # coerce + validate amount
     try:
         amount_val = float(req.amount)
     except Exception:
@@ -315,14 +260,10 @@ def create_payment(req: PaymentRequest):
     if amount_val <= 0:
         raise HTTPException(status_code=400, detail="Invalid amount; must be > 0")
 
-    # merchant_order_id must be unique per attempt - include timestamp
     merchant_order_id = f"ord-{req.booking_id}-{int(datetime.utcnow().timestamp())}"
     amount_paise = int(round(amount_val * 100))
-
-    # coerce user_id to string; if your DB expects UUID ensure frontend sends a proper UUID.
     user_id_str = str(req.user_id)
 
-    # basic heuristic to detect obviously-bad user ids (avoid common DB insertion failures)
     if len(user_id_str) < 6:
         logger.warning("Received suspiciously short user_id; ensure frontend sends user UUID or valid id: %s", user_id_str)
 
@@ -338,14 +279,12 @@ def create_payment(req: PaymentRequest):
         logger.exception("PhonePe create_order failed")
         raise HTTPException(status_code=502, detail=f"PhonePe error: {e}")
 
-    # PhonePe response handling - support top-level or nested 'data'
     redirect_url = None
     phonepe_order_id = None
     state = "PENDING"
     token = None
 
     if isinstance(phonepe_resp, dict):
-        # top-level keys
         redirect_url = phonepe_resp.get("redirectUrl") or phonepe_resp.get("checkout_url") or phonepe_resp.get("checkoutUrl")
         phonepe_order_id = phonepe_resp.get("orderId") or (phonepe_resp.get("data") or {}).get("orderId")
         state = phonepe_resp.get("state") or (phonepe_resp.get("data") or {}).get("state") or state
@@ -353,7 +292,6 @@ def create_payment(req: PaymentRequest):
 
     logger.info("PhonePe response parsed redirect_url=%s order_id=%s state=%s token_present=%s", redirect_url, phonepe_order_id, state, bool(token))
 
-    # Save order to DB. If DB write fails return checkout_url but include warning.
     try:
         supabase.table("orders").insert({
             "merchant_order_id": merchant_order_id,
@@ -375,7 +313,6 @@ def create_payment(req: PaymentRequest):
             "warning": f"Saved to DB failed: {e}"
         }
 
-    # Return checkout details to frontend/app
     return {
         "checkout_url": redirect_url,
         "merchant_order_id": merchant_order_id,
@@ -386,15 +323,8 @@ def create_payment(req: PaymentRequest):
 
 @app.post("/payment/callback")
 async def payment_callback(req: Request, x_phonepe_signature: str | None = Header(None)):
-    """
-    PhonePe server-to-server callback. PhonePe will POST details here.
-    This route verifies signature before trusting the payload.
-    The example uses header 'X-PHONEPE-SIGNATURE' and HMAC-SHA256 hex digest.
-    Replace with exact verification per PhonePe docs.
-    """
     raw = await req.body()
 
-    # Verify signature - important
     if not verify_phonepe_signature(raw, x_phonepe_signature):
         logger.warning("PhonePe callback signature verification failed")
         raise HTTPException(status_code=401, detail="Invalid signature")
@@ -406,11 +336,9 @@ async def payment_callback(req: Request, x_phonepe_signature: str | None = Heade
 
     logger.info("PhonePe callback received (verified): %s", payload)
 
-    # attempt to extract merchantOrderId / merchantTransactionId and status/state
     merchant_order_id = payload.get("merchantTransactionId") or payload.get("merchantOrderId") or payload.get("merchant_order_id")
     status = payload.get("status") or payload.get("state") or payload.get("payment_state")
 
-    # also check nested data block
     data_block = payload.get("data") if isinstance(payload.get("data"), dict) else None
     if not merchant_order_id and data_block:
         merchant_order_id = data_block.get("merchantTransactionId") or data_block.get("merchantOrderId")
@@ -433,8 +361,6 @@ async def payment_callback(req: Request, x_phonepe_signature: str | None = Heade
 
 @app.get("/payment-success")
 def payment_success():
-    # Browser redirect target after payment — PhonePe will redirect user here.
-    # Return a simple HTML page (middleware will attach required headers).
     html = """
     <!doctype html>
     <html>
@@ -460,7 +386,6 @@ def payment_success():
         <script>
           document.getElementById('closeBtn').addEventListener('click', function(){
             try { window.close(); } catch (e) {}
-            // fallback to about:blank
             location.href = 'about:blank';
           });
         </script>
@@ -482,14 +407,11 @@ def order_status(merchant_order_id: str):
         "amount": order.get("amount")
     }
 
-# --- Diagnostic endpoints (temporary) ---
-DIAG_ENV_VAR = "DIAG_SECRET"  # set this env var on your hosting platform to a secret value
+DIAG_ENV_VAR = "DIAG_SECRET"
 
 def _check_diag_key(x_diag: str | None):
-    # simple header-based auth so only you can hit these endpoints
     expected = os.getenv(DIAG_ENV_VAR)
     if not expected:
-        # if DIAG_SECRET is not set, refuse to run diagnostics
         raise HTTPException(status_code=403, detail="Diag disabled (no DIAG_SECRET set)")
     if x_diag != expected:
         raise HTTPException(status_code=401, detail="Invalid diag secret")
@@ -498,7 +420,6 @@ def _check_diag_key(x_diag: str | None):
 @app.get("/diag/packages")
 def diag_packages(x_diag: str | None = Header(None)):
     _check_diag_key(x_diag)
-    # report installed versions for key packages
     out = {}
     try:
         import pkg_resources
@@ -515,7 +436,6 @@ def diag_packages(x_diag: str | None = Header(None)):
 @app.get("/diag/bcrypt")
 def diag_bcrypt(x_diag: str | None = Header(None)):
     _check_diag_key(x_diag)
-    # attempt to import bcrypt and report the module file path (not the content)
     try:
         import bcrypt as _bcrypt
         path = getattr(_bcrypt, "__file__", None)
@@ -526,19 +446,13 @@ def diag_bcrypt(x_diag: str | None = Header(None)):
 @app.get("/diag/phonepe-token-check")
 def diag_phonepe_token(x_diag: str | None = Header(None)):
     _check_diag_key(x_diag)
-    """
-    Diagnostic: check whether a token exists and return expiry info.
-    This does NOT return the token string or any secret.
-    """
     try:
         info = phonepe_token_info()
     except Exception as e:
         logger.exception("phonepe_token_info failed")
         return {"error": str(e)}
-    # info returns has_token, expires_at, expires_at_iso, issued_at
     return info
 
-# --- end diagnostics ---
 
 
 
