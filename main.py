@@ -49,7 +49,10 @@ async def add_security_headers(request: Request, call_next):
     response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
     return response
 
-pwd_context = CryptContext(schemes=["bcrypt_sha256"], deprecated="auto")
+pwd_context = CryptContext(
+    schemes=["bcrypt_sha256", "bcrypt"],  # support both, just in case
+    deprecated="auto",
+)
 
 class SendOTPRequest(BaseModel):
     phone: str
@@ -138,11 +141,33 @@ def signup(data: VerifyOTPRequest):
 def login(user: UserLogin):
     res = supabase.table("users").select("*").eq("phone", user.phone).execute()
     if not res.data:
-        raise HTTPException(status_code=401, detail="User not found")
+        # Don't leak which part is wrong; generic error is better
+        raise HTTPException(status_code=401, detail="Invalid phone or password")
+
     db_user = res.data[0]
-    if not pwd_context.verify(user.password, db_user["password_hash"]):
-        raise HTTPException(status_code=401, detail="Incorrect password")
-    return {"message": f"Welcome {db_user.get('name')}", "user": {k: v for k, v in db_user.items() if k != "password_hash"}}
+    stored_hash = db_user.get("password_hash")
+
+    if not stored_hash:
+        logger.warning("User %s has no password_hash stored", db_user.get("id"))
+        raise HTTPException(status_code=401, detail="Invalid phone or password")
+
+    try:
+        is_valid = pwd_context.verify(user.password, stored_hash)
+    except UnknownHashError:
+        # Hash format in DB is invalid / unknown
+        logger.warning(
+            "Unknown password hash format for user_id=%s: %r",
+            db_user.get("id"),
+            stored_hash if isinstance(stored_hash, str) else type(stored_hash),
+        )
+        raise HTTPException(status_code=401, detail="Invalid phone or password")
+
+    if not is_valid:
+        raise HTTPException(status_code=401, detail="Invalid phone or password")
+
+    sanitized_user = {k: v for k, v in db_user.items() if k != "password_hash"}
+    return {"message": f"Welcome {db_user.get('name')}", "user": sanitized_user}
+
 
 @app.post("/vehicles/add")
 def add_vehicle(data: AddVehicleRequest):
