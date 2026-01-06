@@ -692,6 +692,7 @@ def create_payment(req: PaymentRequest):
     if req.amount <= 0:
         raise HTTPException(status_code=400, detail="Invalid amount")
 
+    # 1️⃣ Create Razorpay order
     try:
         order = razorpay_client.order.create({
             "amount": req.amount * 100,  # paise
@@ -703,26 +704,30 @@ def create_payment(req: PaymentRequest):
         logger.exception("Razorpay order creation failed")
         raise HTTPException(status_code=502, detail=str(e))
 
-    order_id = order["id"]
+    razorpay_order_id = order["id"]
 
-    # Save order
+    # 2️⃣ Generate merchant_order_id (REQUIRED by DB)
+    merchant_order_id = f"rzp-{req.booking_id}-{int(datetime.utcnow().timestamp())}"
+
+    # 3️⃣ Save order in Supabase (MATCHES SCHEMA)
     supabase.table("orders").insert({
+        "merchant_order_id": merchant_order_id,   # ✅ REQUIRED
         "booking_id": req.booking_id,
         "user_id": req.user_id,
         "amount": req.amount * 100,
         "status": "CREATED",
-        "razorpay_order_id": order_id,
-        "created_at": datetime.utcnow().isoformat()
+        "razorpay_order_id": razorpay_order_id     # ✅ NEW COLUMN
     }).execute()
 
-    order_map[order_id] = req.dict()
-
+    # 4️⃣ Return to frontend
     return {
         "razorpay_key": RAZORPAY_KEY_ID,
-        "order_id": order_id,
+        "order_id": razorpay_order_id,
+        "merchant_order_id": merchant_order_id,
         "amount": req.amount * 100,
         "currency": "INR"
     }
+
 
 # -------------------------
 # VERIFY PAYMENT
@@ -742,10 +747,10 @@ def verify_payment(data: VerifyPaymentRequest):
 
     # Update DB
     supabase.table("orders").update({
-        "status": "PAID",
-        "razorpay_payment_id": data.razorpay_payment_id,
-        "updated_at": datetime.utcnow().isoformat()
-    }).eq("razorpay_order_id", data.razorpay_order_id).execute()
+    "status": "PAID",
+    "updated_at": datetime.utcnow().isoformat()
+}).eq("razorpay_order_id", data.razorpay_order_id).execute()
+
 
     return {"status": "success"}
 
