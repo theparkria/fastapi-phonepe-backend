@@ -301,45 +301,53 @@ def book_slot(data: ParkingSlotBookRequest):
 
 @app.post("/create-payment")
 def create_payment(req: PaymentRequest):
-    order = razorpay_client.order.create({
-        "amount": req.amount * 100,
-        "currency": "INR",
-        "receipt": f"booking_{req.booking_id}",
-        "payment_capture": 1
-    })
+    try:
+        # ✅ Convert rupees → paise ONLY HERE
+        amount_paise = req.amount * 100
 
-    merchant_order_id = f"rzp-{req.booking_id}-{int(datetime.utcnow().timestamp())}"
+        order = razorpay_client.order.create({
+            "amount": amount_paise,
+            "currency": "INR",
+            "receipt": f"booking_{req.booking_id}",
+            "payment_capture": 1
+        })
 
-    supabase.table("orders").insert({
-        "merchant_order_id": merchant_order_id,
-        "booking_id": req.booking_id,
-        "user_id": req.user_id,
-        "amount": req.amount * 100,
-        "status": "CREATED",
-        "razorpay_order_id": order["id"]
-    }).execute()
+        merchant_order_id = f"rzp-{req.booking_id}-{int(datetime.utcnow().timestamp())}"
 
-    return {
-        "razorpay_key": RAZORPAY_KEY_ID,
-        "order_id": order["id"],
-        "merchant_order_id": merchant_order_id,
-        "amount": req.amount * 100,
-        "currency": "INR"
-    }
+        supabase.table("orders").insert({
+            "merchant_order_id": merchant_order_id,
+            "booking_id": req.booking_id,
+            "user_id": req.user_id,
+            "amount": amount_paise,
+            "status": "CREATED",
+            "razorpay_order_id": order["id"]
+        }).execute()
+
+        return {
+            "razorpay_key": RAZORPAY_KEY_ID,
+            "order_id": order["id"],
+            "amount": amount_paise,   # ✅ frontend uses paise
+            "currency": "INR"
+        }
+
+    except Exception as e:
+        logger.exception("Create payment failed")
+        raise HTTPException(500, "Payment initiation failed")
+
 
 
 @app.post("/verify-payment")
 def verify_payment(req: VerifyPaymentRequest):
     body = f"{req.razorpay_order_id}|{req.razorpay_payment_id}"
 
-    expected = hmac.new(
+    expected_signature = hmac.new(
         RAZORPAY_KEY_SECRET.encode(),
         body.encode(),
         hashlib.sha256
     ).hexdigest()
 
-    if not hmac.compare_digest(expected, req.razorpay_signature):
-        raise HTTPException(400, "Invalid payment signature")
+    if not hmac.compare_digest(expected_signature, req.razorpay_signature):
+        raise HTTPException(status_code=400, detail="Invalid payment signature")
 
     supabase.table("orders").update({
         "status": "PAID",
@@ -347,6 +355,7 @@ def verify_payment(req: VerifyPaymentRequest):
     }).eq("razorpay_order_id", req.razorpay_order_id).execute()
 
     return {"status": "success"}
+
 
 
 
