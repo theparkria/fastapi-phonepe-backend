@@ -13,6 +13,16 @@ from pydantic import BaseModel
 from supabase import create_client, Client
 from passlib.context import CryptContext
 
+import razorpay
+
+if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
+    raise RuntimeError("Set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET")
+
+razorpay_client = razorpay.Client(
+    auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET)
+)
+
+
 # from phonepe_client import create_order, order_status as phonepe_order_status, token_info as phonepe_token_info
 
 env_path = Path(__file__).resolve().parent / ".env"
@@ -486,10 +496,10 @@ from pydantic import BaseModel
 #     amount: int  # paise
 
 
-class VerifyPaymentRequest(BaseModel):
-    razorpay_order_id: str
-    razorpay_payment_id: str
-    razorpay_signature: str
+# class VerifyPaymentRequest(BaseModel):
+#     razorpay_order_id: str
+#     razorpay_payment_id: str
+#     razorpay_signature: str
 
 
 # -------------------------------
