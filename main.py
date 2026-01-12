@@ -107,22 +107,22 @@ class VerifyPaymentRequest(BaseModel):
     razorpay_signature: str
 
 
-def verify_phonepe_signature(raw_body: bytes, signature_header: str | None) -> bool:
-    secret = os.getenv("PHONEPE_CLIENT_SECRET")
-    if not secret:
-        logger.warning("PHONEPE_CLIENT_SECRET not configured; skipping signature verification (unsafe!).")
-        return False
+# def verify_phonepe_signature(raw_body: bytes, signature_header: str | None) -> bool:
+#     secret = os.getenv("PHONEPE_CLIENT_SECRET")
+#     if not secret:
+#         logger.warning("PHONEPE_CLIENT_SECRET not configured; skipping signature verification (unsafe!).")
+#         return False
 
-    if not signature_header:
-        logger.warning("No signature header present on callback")
-        return False
+#     if not signature_header:
+#         logger.warning("No signature header present on callback")
+#         return False
 
-    try:
-        computed = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
-        return hmac.compare_digest(computed.lower(), signature_header.lower())
-    except Exception as e:
-        logger.exception("Failed verifying signature: %s", e)
-        return False
+#     try:
+#         computed = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+#         return hmac.compare_digest(computed.lower(), signature_header.lower())
+#     except Exception as e:
+#         logger.exception("Failed verifying signature: %s", e)
+#         return False
 
 @app.get("/")
 def root():
@@ -337,43 +337,44 @@ def verify_payment(req: VerifyPaymentRequest):
 
 
 
-@app.post("/payment/callback")
-async def payment_callback(req: Request, x_phonepe_signature: str | None = Header(None)):
-    raw = await req.body()
 
-    if not verify_phonepe_signature(raw, x_phonepe_signature):
-        logger.warning("PhonePe callback signature verification failed")
-        raise HTTPException(status_code=401, detail="Invalid signature")
+# @app.post("/payment/callback")
+# async def payment_callback(req: Request, x_phonepe_signature: str | None = Header(None)):
+#     raw = await req.body()
 
-    try:
-        payload = await req.json()
-    except Exception:
-        payload = {"raw": raw.decode("utf-8", errors="ignore") if raw else ""}
+#     if not verify_phonepe_signature(raw, x_phonepe_signature):
+#         logger.warning("PhonePe callback signature verification failed")
+#         raise HTTPException(status_code=401, detail="Invalid signature")
 
-    logger.info("PhonePe callback received (verified): %s", payload)
+#     try:
+#         payload = await req.json()
+#     except Exception:
+#         payload = {"raw": raw.decode("utf-8", errors="ignore") if raw else ""}
 
-    merchant_order_id = payload.get("merchantTransactionId") or payload.get("merchantOrderId") or payload.get("merchant_order_id")
-    status = payload.get("status") or payload.get("state") or payload.get("payment_state")
+#     logger.info("PhonePe callback received (verified): %s", payload)
 
-    data_block = payload.get("data") if isinstance(payload.get("data"), dict) else None
-    if not merchant_order_id and data_block:
-        merchant_order_id = data_block.get("merchantTransactionId") or data_block.get("merchantOrderId")
-        status = status or data_block.get("state") or data_block.get("status")
+#     merchant_order_id = payload.get("merchantTransactionId") or payload.get("merchantOrderId") or payload.get("merchant_order_id")
+#     status = payload.get("status") or payload.get("state") or payload.get("payment_state")
 
-    if merchant_order_id:
-        try:
-            supabase.table("orders").update({
-                "status": status,
-                "updated_at": datetime.utcnow().isoformat()
-            }).eq("merchant_order_id", merchant_order_id).execute()
-        except Exception as e:
-            logger.exception("Failed updating order status in supabase")
-            return JSONResponse({"message": "callback received; db update failed", "error": str(e)}, status_code=500)
+#     data_block = payload.get("data") if isinstance(payload.get("data"), dict) else None
+#     if not merchant_order_id and data_block:
+#         merchant_order_id = data_block.get("merchantTransactionId") or data_block.get("merchantOrderId")
+#         status = status or data_block.get("state") or data_block.get("status")
 
-        return {"message": "callback processed", "merchant_order_id": merchant_order_id, "status": status}
-    else:
-        logger.warning("Callback missing merchant_order_id: %s", payload)
-        return {"message": "callback received but merchant id missing", "body": payload}
+#     if merchant_order_id:
+#         try:
+#             supabase.table("orders").update({
+#                 "status": status,
+#                 "updated_at": datetime.utcnow().isoformat()
+#             }).eq("merchant_order_id", merchant_order_id).execute()
+#         except Exception as e:
+#             logger.exception("Failed updating order status in supabase")
+#             return JSONResponse({"message": "callback received; db update failed", "error": str(e)}, status_code=500)
+
+#         return {"message": "callback processed", "merchant_order_id": merchant_order_id, "status": status}
+#     else:
+#         logger.warning("Callback missing merchant_order_id: %s", payload)
+#         return {"message": "callback received but merchant id missing", "body": payload}
 
 @app.get("/payment-success")
 def payment_success():
@@ -457,32 +458,32 @@ def diag_bcrypt(x_diag: str | None = Header(None)):
     except Exception as e:
         return {"error": str(e)}
 
-@app.get("/diag/phonepe-token-check")
-def diag_phonepe_token(x_diag: str | None = Header(None)):
-    _check_diag_key(x_diag)
-    try:
-        info = phonepe_token_info()
-    except Exception as e:
-        logger.exception("phonepe_token_info failed")
-        return {"error": str(e)}
-    return info
+# @app.get("/diag/phonepe-token-check")
+# def diag_phonepe_token(x_diag: str | None = Header(None)):
+#     _check_diag_key(x_diag)
+#     try:
+#         info = phonepe_token_info()
+#     except Exception as e:
+#         logger.exception("phonepe_token_info failed")
+#         return {"error": str(e)}
+#     return info
 
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from payment_gateway import (
-    create_razorpay_order,
-    verify_razorpay_payment
-)
+# from payment_gateway import (
+#     create_razorpay_order,
+#     verify_razorpay_payment
+# )
 
-app = FastAPI()
+# app = FastAPI()
 
 # -------------------------------
 # REQUEST MODELS
 # -------------------------------
 
-class CreateOrderRequest(BaseModel):
-    amount: int  # paise
+# class CreateOrderRequest(BaseModel):
+#     amount: int  # paise
 
 
 class VerifyPaymentRequest(BaseModel):
@@ -495,25 +496,25 @@ class VerifyPaymentRequest(BaseModel):
 # API ENDPOINTS
 # -------------------------------
 
-@app.post("/payment/razorpay/create-order")
-def create_order(data: CreateOrderRequest):
-    return create_razorpay_order(data.amount)
+# @app.post("/payment/razorpay/create-order")
+# def create_order(data: CreateOrderRequest):
+#     return create_razorpay_order(data.amount)
 
 
-@app.post("/payment/razorpay/verify")
-def verify_payment(data: VerifyPaymentRequest):
-    valid = verify_razorpay_payment(
-        data.razorpay_order_id,
-        data.razorpay_payment_id,
-        data.razorpay_signature
-    )
+# @app.post("/payment/razorpay/verify")
+# def verify_payment(data: VerifyPaymentRequest):
+#     valid = verify_razorpay_payment(
+#         data.razorpay_order_id,
+#         data.razorpay_payment_id,
+#         data.razorpay_signature
+#     )
 
-    if not valid:
-        raise HTTPException(status_code=400, detail="Invalid payment")
+#     if not valid:
+#         raise HTTPException(status_code=400, detail="Invalid payment")
 
-    # ✅ Save booking + payment here
+#     # ✅ Save booking + payment here
 
-    return {"status": "success"}
+#     return {"status": "success"}
 
 
 
