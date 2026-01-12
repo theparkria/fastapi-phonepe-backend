@@ -600,19 +600,16 @@
 
 import os
 import logging
-import hmac
-import hashlib
 from datetime import datetime
 from pathlib import Path
-from typing import Dict
+import uuid
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request, Query, Header
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from supabase import create_client, Client
-from passlib.context import CryptContext
 import razorpay
 
 # -------------------------
@@ -653,11 +650,6 @@ app.add_middleware(
 )
 
 # -------------------------
-# PASSWORD
-# -------------------------
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-# -------------------------
 # MODELS
 # -------------------------
 class PaymentRequest(BaseModel):
@@ -671,11 +663,6 @@ class VerifyPaymentRequest(BaseModel):
     razorpay_payment_id: str
     razorpay_signature: str
 
-
-# -------------------------
-# IN-MEMORY MAP (replace with DB if needed)
-# -------------------------
-order_map: Dict[str, dict] = {}
 
 # -------------------------
 # ROOT
@@ -692,7 +679,12 @@ def create_payment(req: PaymentRequest):
     if req.amount <= 0:
         raise HTTPException(status_code=400, detail="Invalid amount")
 
-    # 1️⃣ Create Razorpay order
+    # Validate UUID
+    try:
+        uuid.UUID(req.user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid user_id (must be UUID)")
+
     try:
         order = razorpay_client.order.create({
             "amount": req.amount * 100,  # paise
@@ -705,21 +697,17 @@ def create_payment(req: PaymentRequest):
         raise HTTPException(status_code=502, detail=str(e))
 
     razorpay_order_id = order["id"]
-
-    # 2️⃣ Generate merchant_order_id (REQUIRED by DB)
     merchant_order_id = f"rzp-{req.booking_id}-{int(datetime.utcnow().timestamp())}"
 
-    # 3️⃣ Save order in Supabase (MATCHES SCHEMA)
     supabase.table("orders").insert({
-        "merchant_order_id": merchant_order_id,   # ✅ REQUIRED
+        "merchant_order_id": merchant_order_id,
         "booking_id": req.booking_id,
         "user_id": req.user_id,
         "amount": req.amount * 100,
         "status": "CREATED",
-        "razorpay_order_id": razorpay_order_id     # ✅ NEW COLUMN
+        "razorpay_order_id": razorpay_order_id
     }).execute()
 
-    # 4️⃣ Return to frontend
     return {
         "razorpay_key": RAZORPAY_KEY_ID,
         "order_id": razorpay_order_id,
@@ -728,34 +716,29 @@ def create_payment(req: PaymentRequest):
         "currency": "INR"
     }
 
-
 # -------------------------
 # VERIFY PAYMENT
 # -------------------------
 @app.post("/verify-payment")
 def verify_payment(data: VerifyPaymentRequest):
-    body = f"{data.razorpay_order_id}|{data.razorpay_payment_id}"
-
-    expected_signature = hmac.new(
-        RAZORPAY_KEY_SECRET.encode(),
-        body.encode(),
-        hashlib.sha256
-    ).hexdigest()
-
-    if not hmac.compare_digest(expected_signature, data.razorpay_signature):
+    try:
+        razorpay_client.utility.verify_payment_signature({
+            "razorpay_order_id": data.razorpay_order_id,
+            "razorpay_payment_id": data.razorpay_payment_id,
+            "razorpay_signature": data.razorpay_signature
+        })
+    except Exception:
         raise HTTPException(status_code=400, detail="Invalid payment signature")
 
-    # Update DB
     supabase.table("orders").update({
-    "status": "PAID",
-    "updated_at": datetime.utcnow().isoformat()
-}).eq("razorpay_order_id", data.razorpay_order_id).execute()
-
+        "status": "PAID",
+        "updated_at": datetime.utcnow().isoformat()
+    }).eq("razorpay_order_id", data.razorpay_order_id).execute()
 
     return {"status": "success"}
 
 # -------------------------
-# PAYMENT SUCCESS PAGE (OPTIONAL)
+# PAYMENT SUCCESS PAGE
 # -------------------------
 @app.get("/payment-success")
 def payment_success():
@@ -776,5 +759,4 @@ def order_status(order_id: str):
     res = supabase.table("orders").select("*").eq("razorpay_order_id", order_id).execute()
     if not res.data:
         raise HTTPException(status_code=404, detail="Order not found")
-
     return res.data[0]
