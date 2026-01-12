@@ -626,7 +626,7 @@ RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
 RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
 
 if not all([SUPABASE_URL, SUPABASE_SERVICE_KEY, RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET]):
-    raise RuntimeError("Missing required environment variables")
+    raise RuntimeError("❌ Missing required environment variables")
 
 # =====================================================
 # LOGGING
@@ -638,7 +638,9 @@ logger.setLevel(logging.INFO)
 # CLIENTS
 # =====================================================
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+razorpay_client = razorpay.Client(
+    auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET)
+)
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -649,7 +651,7 @@ app = FastAPI(title="Parkria Backend – Full API + Razorpay")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],   # tighten later
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -679,8 +681,8 @@ class VehicleRequest(BaseModel):
 
 class PaymentRequest(BaseModel):
     booking_id: int
-    amount: int
-    user_id: str
+    amount: int       # INR
+    user_id: str      # UUID
 
 class VerifyPaymentRequest(BaseModel):
     razorpay_order_id: str
@@ -699,6 +701,7 @@ def root():
 # =====================================================
 @app.post("/send-otp")
 def send_otp(req: SendOTPRequest):
+    # Demo OTP only
     return {"message": f"OTP sent to {req.phone}", "otp": "1234"}
 
 @app.post("/signup")
@@ -707,14 +710,17 @@ def signup(req: SignupRequest):
     if exists.data:
         raise HTTPException(400, "User already exists")
 
-    hashed = pwd_context.hash(req.password)
+    password_hash = pwd_context.hash(req.password)
+
     res = supabase.table("users").insert({
         "name": req.name,
         "phone": req.phone,
-        "password_hash": hashed
+        "password_hash": password_hash
     }).execute()
 
-    return {"user": res.data[0]}
+    user = res.data[0]
+    user.pop("password_hash", None)
+    return {"user": user}
 
 @app.post("/login")
 def login(req: LoginRequest):
@@ -739,18 +745,17 @@ def add_vehicle(req: VehicleRequest):
 
 @app.get("/vehicles")
 def get_vehicles(user_id: str = Query(...)):
-    res = supabase.table("vehicles").select("*").eq("user_id", user_id).execute()
-    return res.data
+    return supabase.table("vehicles").select("*").eq("user_id", user_id).execute().data
 
 # =====================================================
-# SERVICES & SLOTS
+# SERVICES & PARKING SLOTS
 # =====================================================
 @app.get("/services")
 def get_services():
     return supabase.table("service_types").select("*").execute().data
 
 @app.get("/parking-slots")
-def get_slots(unit_id: int = Query(...)):
+def get_parking_slots(unit_id: int = Query(...)):
     return supabase.table("parking_slots").select("*").eq("unit_id", unit_id).execute().data
 
 # =====================================================
@@ -758,12 +763,19 @@ def get_slots(unit_id: int = Query(...)):
 # =====================================================
 @app.post("/create-payment")
 def create_payment(req: PaymentRequest):
-    order = razorpay_client.order.create({
-        "amount": req.amount * 100,
-        "currency": "INR",
-        "receipt": f"booking_{req.booking_id}",
-        "payment_capture": 1
-    })
+    if req.amount <= 0:
+        raise HTTPException(400, "Invalid amount")
+
+    try:
+        order = razorpay_client.order.create({
+            "amount": req.amount * 100,  # paise
+            "currency": "INR",
+            "receipt": f"booking_{req.booking_id}",
+            "payment_capture": 1
+        })
+    except Exception as e:
+        logger.exception("Razorpay order creation failed")
+        raise HTTPException(502, str(e))
 
     merchant_order_id = f"rzp-{req.booking_id}-{int(datetime.utcnow().timestamp())}"
 
@@ -790,14 +802,15 @@ def create_payment(req: PaymentRequest):
 @app.post("/verify-payment")
 def verify_payment(req: VerifyPaymentRequest):
     body = f"{req.razorpay_order_id}|{req.razorpay_payment_id}"
-    expected = hmac.new(
+
+    expected_signature = hmac.new(
         RAZORPAY_KEY_SECRET.encode(),
         body.encode(),
         hashlib.sha256
     ).hexdigest()
 
-    if not hmac.compare_digest(expected, req.razorpay_signature):
-        raise HTTPException(400, "Invalid signature")
+    if not hmac.compare_digest(expected_signature, req.razorpay_signature):
+        raise HTTPException(400, "Invalid payment signature")
 
     supabase.table("orders").update({
         "status": "PAID",
@@ -814,8 +827,10 @@ def order_status(razorpay_order_id: str):
     res = supabase.table("orders").select("*").eq(
         "razorpay_order_id", razorpay_order_id
     ).execute()
+
     if not res.data:
         raise HTTPException(404, "Order not found")
+
     return res.data[0]
 
 # =====================================================
@@ -824,6 +839,10 @@ def order_status(razorpay_order_id: str):
 @app.get("/payment-success")
 def payment_success():
     return HTMLResponse("""
-    <h2>✅ Payment Successful</h2>
-    <p>You may return to the app.</p>
+    <html>
+      <body style="font-family:Arial;text-align:center;padding-top:40px">
+        <h2>✅ Payment Successful</h2>
+        <p>You may now return to the app.</p>
+      </body>
+    </html>
     """)
