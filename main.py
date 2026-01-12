@@ -15,12 +15,7 @@ from passlib.context import CryptContext
 
 import razorpay
 
-if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
-    raise RuntimeError("Set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET")
 
-razorpay_client = razorpay.Client(
-    auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET)
-)
 
 
 # from phonepe_client import create_order, order_status as phonepe_order_status, token_info as phonepe_token_info
@@ -34,6 +29,14 @@ logger.info("ENV CHECK - SUPABASE_URL present: %s", bool(os.getenv("SUPABASE_URL
 logger.info("ENV CHECK - SUPABASE_SERVICE_KEY present: %s", bool(os.getenv("SUPABASE_SERVICE_KEY")))
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
 RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
+
+
+if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
+    raise RuntimeError("Set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET")
+
+razorpay_client = razorpay.Client(
+    auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET)
+)
 class VerifyPaymentRequest(BaseModel):
     razorpay_order_id: str
     razorpay_payment_id: str
