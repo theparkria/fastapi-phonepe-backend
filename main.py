@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from supabase import create_client, Client
 from passlib.context import CryptContext
 
-from phonepe_client import create_order, order_status as phonepe_order_status, token_info as phonepe_token_info
+# from phonepe_client import create_order, order_status as phonepe_order_status, token_info as phonepe_token_info
 
 env_path = Path(__file__).resolve().parent / ".env"
 load_dotenv(env_path)
@@ -22,9 +22,13 @@ logger = logging.getLogger("uvicorn.error")
 logger.setLevel(logging.INFO)
 logger.info("ENV CHECK - SUPABASE_URL present: %s", bool(os.getenv("SUPABASE_URL")))
 logger.info("ENV CHECK - SUPABASE_SERVICE_KEY present: %s", bool(os.getenv("SUPABASE_SERVICE_KEY")))
-logger.info("ENV CHECK - PHONEPE_MERCHANT_ID present: %s", bool(os.getenv("PHONEPE_MERCHANT_ID")))
-logger.info("ENV CHECK - PHONEPE_CLIENT_SECRET present: %s", bool(os.getenv("PHONEPE_CLIENT_SECRET")))
-logger.info("ENV CHECK - PHONEPE_ENV present: %s", bool(os.getenv("PHONEPE_ENV")))
+RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
+RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
+class VerifyPaymentRequest(BaseModel):
+    razorpay_order_id: str
+    razorpay_payment_id: str
+    razorpay_signature: str
+
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
@@ -33,7 +37,7 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
-app = FastAPI(title="Parkria Backend - PhonePe")
+app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -96,6 +100,12 @@ class PaymentRequest(BaseModel):
     booking_id: int
     amount: int
     user_id: str
+
+class VerifyPaymentRequest(BaseModel):
+    razorpay_order_id: str
+    razorpay_payment_id: str
+    razorpay_signature: str
+
 
 def verify_phonepe_signature(raw_body: bytes, signature_header: str | None) -> bool:
     secret = os.getenv("PHONEPE_CLIENT_SECRET")
@@ -324,6 +334,7 @@ def verify_payment(req: VerifyPaymentRequest):
     }).eq("razorpay_order_id", req.razorpay_order_id).execute()
 
     return {"status": "success"}
+
 
 
 @app.post("/payment/callback")
