@@ -600,9 +600,10 @@
 
 import os
 import logging
+import hmac
+import hashlib
 from datetime import datetime
 from pathlib import Path
-import uuid
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -612,9 +613,9 @@ from pydantic import BaseModel
 from supabase import create_client, Client
 import razorpay
 
-# -------------------------
-# ENV
-# -------------------------
+# =====================================================
+# ENVIRONMENT
+# =====================================================
 env_path = Path(__file__).resolve().parent / ".env"
 load_dotenv(env_path)
 
@@ -623,25 +624,37 @@ SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
 RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
 
-if not all([SUPABASE_URL, SUPABASE_SERVICE_KEY, RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET]):
-    raise RuntimeError("Missing required environment variables")
+if not all([
+    SUPABASE_URL,
+    SUPABASE_SERVICE_KEY,
+    RAZORPAY_KEY_ID,
+    RAZORPAY_KEY_SECRET
+]):
+    raise RuntimeError("❌ Missing required environment variables")
 
-# -------------------------
+# =====================================================
 # LOGGING
-# -------------------------
+# =====================================================
 logger = logging.getLogger("uvicorn.error")
 logger.setLevel(logging.INFO)
 
-# -------------------------
+# =====================================================
 # CLIENTS
-# -------------------------
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+# =====================================================
+supabase: Client = create_client(
+    SUPABASE_URL,
+    SUPABASE_SERVICE_KEY
+)
 
-# -------------------------
-# FASTAPI
-# -------------------------
-app = FastAPI(title="Parkria Backend - Razorpay")
+razorpay_client = razorpay.Client(
+    auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET)
+)
+
+# =====================================================
+# FASTAPI APP
+# =====================================================
+app = FastAPI(title="Parkria Backend – Razorpay")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -649,13 +662,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -------------------------
+# =====================================================
 # MODELS
-# -------------------------
+# =====================================================
 class PaymentRequest(BaseModel):
     booking_id: int
-    amount: int  # INR
-    user_id: str
+    amount: int   # INR
+    user_id: str  # UUID
 
 
 class VerifyPaymentRequest(BaseModel):
@@ -663,31 +676,25 @@ class VerifyPaymentRequest(BaseModel):
     razorpay_payment_id: str
     razorpay_signature: str
 
-
-# -------------------------
+# =====================================================
 # ROOT
-# -------------------------
+# =====================================================
 @app.get("/")
 def root():
     return {"message": "🚀 Razorpay API Running"}
 
-# -------------------------
+# =====================================================
 # CREATE PAYMENT
-# -------------------------
+# =====================================================
 @app.post("/create-payment")
 def create_payment(req: PaymentRequest):
     if req.amount <= 0:
         raise HTTPException(status_code=400, detail="Invalid amount")
 
-    # Validate UUID
-    try:
-        uuid.UUID(req.user_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid user_id (must be UUID)")
-
+    # 1️⃣ Create Razorpay order
     try:
         order = razorpay_client.order.create({
-            "amount": req.amount * 100,  # paise
+            "amount": req.amount * 100,   # paise
             "currency": "INR",
             "receipt": f"booking_{req.booking_id}",
             "payment_capture": 1
@@ -697,17 +704,26 @@ def create_payment(req: PaymentRequest):
         raise HTTPException(status_code=502, detail=str(e))
 
     razorpay_order_id = order["id"]
+
+    # 2️⃣ Generate merchant_order_id (unique)
     merchant_order_id = f"rzp-{req.booking_id}-{int(datetime.utcnow().timestamp())}"
 
-    supabase.table("orders").insert({
-        "merchant_order_id": merchant_order_id,
-        "booking_id": req.booking_id,
-        "user_id": req.user_id,
-        "amount": req.amount * 100,
-        "status": "CREATED",
-        "razorpay_order_id": razorpay_order_id
-    }).execute()
+    # 3️⃣ Save order in Supabase (matches schema)
+    try:
+        supabase.table("orders").insert({
+            "merchant_order_id": merchant_order_id,
+            "booking_id": req.booking_id,
+            "user_id": req.user_id,
+            "amount": req.amount * 100,
+            "status": "CREATED",
+            "razorpay_order_id": razorpay_order_id,
+            "created_at": datetime.utcnow().isoformat()
+        }).execute()
+    except Exception as e:
+        logger.exception("Supabase order insert failed")
+        raise HTTPException(status_code=500, detail="Failed to save order")
 
+    # 4️⃣ Return details to frontend
     return {
         "razorpay_key": RAZORPAY_KEY_ID,
         "order_id": razorpay_order_id,
@@ -716,30 +732,35 @@ def create_payment(req: PaymentRequest):
         "currency": "INR"
     }
 
-# -------------------------
+# =====================================================
 # VERIFY PAYMENT
-# -------------------------
+# =====================================================
 @app.post("/verify-payment")
 def verify_payment(data: VerifyPaymentRequest):
-    try:
-        razorpay_client.utility.verify_payment_signature({
-            "razorpay_order_id": data.razorpay_order_id,
-            "razorpay_payment_id": data.razorpay_payment_id,
-            "razorpay_signature": data.razorpay_signature
-        })
-    except Exception:
+    body = f"{data.razorpay_order_id}|{data.razorpay_payment_id}"
+
+    expected_signature = hmac.new(
+        RAZORPAY_KEY_SECRET.encode(),
+        body.encode(),
+        hashlib.sha256
+    ).hexdigest()
+
+    if not hmac.compare_digest(expected_signature, data.razorpay_signature):
         raise HTTPException(status_code=400, detail="Invalid payment signature")
 
+    # Update order status
     supabase.table("orders").update({
         "status": "PAID",
         "updated_at": datetime.utcnow().isoformat()
-    }).eq("razorpay_order_id", data.razorpay_order_id).execute()
+    }).eq(
+        "razorpay_order_id", data.razorpay_order_id
+    ).execute()
 
     return {"status": "success"}
 
-# -------------------------
-# PAYMENT SUCCESS PAGE
-# -------------------------
+# =====================================================
+# PAYMENT SUCCESS PAGE (OPTIONAL)
+# =====================================================
 @app.get("/payment-success")
 def payment_success():
     return HTMLResponse("""
@@ -751,12 +772,17 @@ def payment_success():
     </html>
     """)
 
-# -------------------------
+# =====================================================
 # ORDER STATUS
-# -------------------------
-@app.get("/order-status/{order_id}")
-def order_status(order_id: str):
-    res = supabase.table("orders").select("*").eq("razorpay_order_id", order_id).execute()
+# =====================================================
+@app.get("/order-status/{razorpay_order_id}")
+def order_status(razorpay_order_id: str):
+    res = supabase.table("orders") \
+        .select("*") \
+        .eq("razorpay_order_id", razorpay_order_id) \
+        .execute()
+
     if not res.data:
         raise HTTPException(status_code=404, detail="Order not found")
+
     return res.data[0]
