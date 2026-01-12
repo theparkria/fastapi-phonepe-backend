@@ -599,23 +599,23 @@
 
 
 import os
+from pathlib import Path
 import logging
 import hmac
 import hashlib
 from datetime import datetime
-from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Request, Query, Header, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from supabase import create_client, Client
 from passlib.context import CryptContext
 import razorpay
 
 # =====================================================
-# ENVIRONMENT
+# ENV
 # =====================================================
 env_path = Path(__file__).resolve().parent / ".env"
 load_dotenv(env_path)
@@ -640,19 +640,30 @@ logger.setLevel(logging.INFO)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+pwd_context = CryptContext(
+    schemes=["bcrypt_sha256", "bcrypt"],
+    deprecated="auto",
+)
 
 # =====================================================
-# FASTAPI APP
+# FASTAPI
 # =====================================================
-app = FastAPI(title="Parkria Backend – Production (Razorpay)")
+app = FastAPI(title="Parkria Backend – Razorpay")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten in prod if needed
+    allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response: Response = await call_next(request)
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+    return response
 
 # =====================================================
 # MODELS
@@ -660,16 +671,17 @@ app.add_middleware(
 class SendOTPRequest(BaseModel):
     phone: str
 
-class SignupRequest(BaseModel):
+class VerifyOTPRequest(BaseModel):
     name: str
     phone: str
+    otp: str
     password: str
 
-class LoginRequest(BaseModel):
+class UserLogin(BaseModel):
     phone: str
     password: str
 
-class VehicleRequest(BaseModel):
+class AddVehicleRequest(BaseModel):
     user_id: str
     owner_name: str
     car_brand: str
@@ -677,10 +689,27 @@ class VehicleRequest(BaseModel):
     car_type: str
     car_number: str
 
+class ParkingSlotBookRequest(BaseModel):
+    slot_id: int
+    vehicle_id: int
+    user_id: str
+
+class TokenPurchaseRequest(BaseModel):
+    service_type_id: int
+    user_id: str
+    token_count: int
+
+class ConsumeTokenRequest(BaseModel):
+    user_id: str
+    service_type_id: int
+    token_count: int
+    booking_date: str
+    slot_id: int | None = None
+
 class PaymentRequest(BaseModel):
     booking_id: int
-    amount: int          # INR
-    user_id: str         # UUID
+    amount: int
+    user_id: str
 
 class VerifyPaymentRequest(BaseModel):
     razorpay_order_id: str
@@ -692,75 +721,169 @@ class VerifyPaymentRequest(BaseModel):
 # =====================================================
 @app.get("/")
 def root():
-    return {"message": "🚀 Parkria Backend Running (Razorpay)"}
+    return {"message": "🚀 API Running"}
 
 # =====================================================
 # AUTH
 # =====================================================
 @app.post("/send-otp")
-def send_otp(req: SendOTPRequest):
-    return {"message": f"OTP sent to {req.phone}", "otp": "1234"}
+def send_otp(data: SendOTPRequest):
+    return {"message": f"OTP sent to +91{data.phone}", "otp": "1234"}
 
 @app.post("/signup")
-def signup(req: SignupRequest):
-    exists = supabase.table("users").select("*").eq("phone", req.phone).execute()
+def signup(data: VerifyOTPRequest):
+    exists = supabase.table("users").select("*").eq("phone", data.phone).execute()
     if exists.data:
-        raise HTTPException(400, "User already exists")
+        raise HTTPException(status_code=400, detail="User already exists")
 
-    hashed = pwd_context.hash(req.password)
+    password_hash = pwd_context.hash(data.password)
     res = supabase.table("users").insert({
-        "name": req.name,
-        "phone": req.phone,
-        "password_hash": hashed
+        "name": data.name,
+        "phone": data.phone,
+        "password_hash": password_hash,
+        "created_at": datetime.utcnow().isoformat()
     }).execute()
 
-    return {"user": res.data[0]}
+    return {"message": "Signup successful", "user_id": res.data[0]["id"]}
 
 @app.post("/login")
-def login(req: LoginRequest):
-    res = supabase.table("users").select("*").eq("phone", req.phone).execute()
+def login(user: UserLogin):
+    res = supabase.table("users").select("*").eq("phone", user.phone).execute()
     if not res.data:
-        raise HTTPException(401, "Invalid credentials")
+        raise HTTPException(status_code=401, detail="Invalid phone or password")
 
-    user = res.data[0]
-    if not pwd_context.verify(req.password, user["password_hash"]):
-        raise HTTPException(401, "Invalid credentials")
+    db_user = res.data[0]
+    if not pwd_context.verify(user.password, db_user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid phone or password")
 
-    user.pop("password_hash", None)
-    return {"user": user}
+    db_user.pop("password_hash", None)
+    return {"user": db_user}
 
 # =====================================================
 # VEHICLES
 # =====================================================
 @app.post("/vehicles/add")
-def add_vehicle(req: VehicleRequest):
-    res = supabase.table("vehicles").insert(req.dict()).execute()
+def add_vehicle(data: AddVehicleRequest):
+    exists = supabase.table("vehicles").select("*").eq("car_number", data.car_number).execute()
+    if exists.data:
+        raise HTTPException(status_code=400, detail="Car number already registered")
+
+    res = supabase.table("vehicles").insert({
+        **data.dict(),
+        "created_at": datetime.utcnow().isoformat()
+    }).execute()
+
     return {"vehicle": res.data[0]}
 
 @app.get("/vehicles")
-def get_vehicles(user_id: str = Query(...)):
-    res = supabase.table("vehicles").select("*").eq("user_id", user_id).execute()
-    return res.data
+def get_user_vehicles(user_id: str = Query(...)):
+    return supabase.table("vehicles") \
+        .select("vehicle_id, car_number") \
+        .eq("user_id", user_id) \
+        .order("vehicle_id") \
+        .execute().data or []
 
 # =====================================================
-# SERVICES & PARKING
+# SERVICES / TOKENS
 # =====================================================
 @app.get("/services")
 def get_services():
-    return supabase.table("service_types").select("*").execute().data
+    return supabase.table("service_types").select("*").execute().data or []
 
-@app.get("/parking-slots")
-def get_parking_slots(unit_id: int = Query(...)):
-    return supabase.table("parking_slots").select("*").eq("unit_id", unit_id).execute().data
+@app.post("/purchase-token")
+def purchase_token(data: TokenPurchaseRequest):
+    existing = supabase.table("purchased_tokens") \
+        .select("*") \
+        .eq("user_id", data.user_id) \
+        .eq("service_type_id", data.service_type_id) \
+        .execute()
+
+    if existing.data:
+        token_id = existing.data[0]["token_id"]
+        new_count = existing.data[0]["token_count"] + data.token_count
+
+        res = supabase.table("purchased_tokens") \
+            .update({"token_count": new_count, "updated_at": datetime.utcnow().isoformat()}) \
+            .eq("token_id", token_id) \
+            .execute()
+
+        return {"message": "Tokens updated", "purchase": res.data[0]}
+
+    res = supabase.table("purchased_tokens").insert({
+        "user_id": data.user_id,
+        "service_type_id": data.service_type_id,
+        "token_count": data.token_count,
+        "created_at": datetime.utcnow().isoformat(),
+        "updated_at": datetime.utcnow().isoformat()
+    }).execute()
+
+    return {"message": "Purchase saved", "purchase": res.data[0]}
+
+@app.post("/consume-token")
+def consume_token(data: ConsumeTokenRequest):
+    purchased = supabase.table("purchased_tokens") \
+        .select("*") \
+        .eq("user_id", data.user_id) \
+        .eq("service_type_id", data.service_type_id) \
+        .execute()
+
+    if not purchased.data:
+        raise HTTPException(status_code=404, detail="No tokens available")
+
+    remaining = data.token_count
+    for row in purchased.data:
+        use = min(row["token_count"], remaining)
+        supabase.table("purchased_tokens").update({
+            "token_count": row["token_count"] - use,
+            "updated_at": datetime.utcnow().isoformat()
+        }).eq("token_id", row["token_id"]).execute()
+
+        remaining -= use
+        if remaining <= 0:
+            break
+
+    if remaining > 0:
+        raise HTTPException(status_code=400, detail="Insufficient tokens")
+
+    return {"message": "Token consumed"}
 
 # =====================================================
-# RAZORPAY – CREATE PAYMENT
+# PARKING SLOTS
+# =====================================================
+@app.get("/parking-slots")
+def get_parking_slots(unit_id: int = Query(...)):
+    return {
+        "total_slots": 30,
+        "slots": supabase.table("parking_slots")
+            .select("*")
+            .eq("unit_id", unit_id)
+            .execute().data or []
+    }
+
+@app.post("/parking-slots/book")
+def book_slot(data: ParkingSlotBookRequest):
+    slot = supabase.table("parking_slots") \
+        .select("*") \
+        .eq("slot_id", data.slot_id) \
+        .eq("status", "available") \
+        .execute()
+
+    if not slot.data:
+        raise HTTPException(status_code=400, detail="Slot not available")
+
+    res = supabase.table("parking_slots").update({
+        "status": "occupied",
+        "current_vehicle_id": data.vehicle_id,
+        "updated_at": datetime.utcnow().isoformat()
+    }).eq("slot_id", data.slot_id).execute()
+
+    return {"slot": res.data[0]}
+
+# =====================================================
+# RAZORPAY PAYMENTS
 # =====================================================
 @app.post("/create-payment")
 def create_payment(req: PaymentRequest):
-    if req.amount <= 0:
-        raise HTTPException(400, "Invalid amount")
-
     order = razorpay_client.order.create({
         "amount": req.amount * 100,
         "currency": "INR",
@@ -776,7 +899,8 @@ def create_payment(req: PaymentRequest):
         "user_id": req.user_id,
         "amount": req.amount * 100,
         "status": "CREATED",
-        "razorpay_order_id": order["id"]
+        "razorpay_order_id": order["id"],
+        "created_at": datetime.utcnow().isoformat()
     }).execute()
 
     return {
@@ -787,54 +911,32 @@ def create_payment(req: PaymentRequest):
         "currency": "INR"
     }
 
-# =====================================================
-# RAZORPAY – VERIFY PAYMENT
-# =====================================================
 @app.post("/verify-payment")
-def verify_payment(req: VerifyPaymentRequest):
-    body = f"{req.razorpay_order_id}|{req.razorpay_payment_id}"
-
-    expected_signature = hmac.new(
+def verify_payment(data: VerifyPaymentRequest):
+    body = f"{data.razorpay_order_id}|{data.razorpay_payment_id}"
+    expected = hmac.new(
         RAZORPAY_KEY_SECRET.encode(),
         body.encode(),
         hashlib.sha256
     ).hexdigest()
 
-    if not hmac.compare_digest(expected_signature, req.razorpay_signature):
-        raise HTTPException(400, "Invalid payment signature")
+    if not hmac.compare_digest(expected, data.razorpay_signature):
+        raise HTTPException(status_code=400, detail="Invalid payment signature")
 
     supabase.table("orders").update({
         "status": "PAID",
         "updated_at": datetime.utcnow().isoformat()
-    }).eq("razorpay_order_id", req.razorpay_order_id).execute()
+    }).eq("razorpay_order_id", data.razorpay_order_id).execute()
 
     return {"status": "success"}
 
-# =====================================================
-# ORDER STATUS
-# =====================================================
 @app.get("/order-status/{razorpay_order_id}")
 def order_status(razorpay_order_id: str):
-    res = supabase.table("orders").select("*").eq(
-        "razorpay_order_id", razorpay_order_id
-    ).execute()
-
+    res = supabase.table("orders").select("*").eq("razorpay_order_id", razorpay_order_id).execute()
     if not res.data:
-        raise HTTPException(404, "Order not found")
-
+        raise HTTPException(status_code=404, detail="Order not found")
     return res.data[0]
 
-# =====================================================
-# PAYMENT SUCCESS PAGE
-# =====================================================
 @app.get("/payment-success")
 def payment_success():
-    return HTMLResponse("""
-    <html>
-      <body style="font-family:Arial;text-align:center;padding-top:40px">
-        <h2>✅ Payment Successful</h2>
-        <p>You may now return to the app.</p>
-      </body>
-    </html>
-    """)
-
+    return HTMLResponse("<h2>✅ Payment Successful</h2>")
