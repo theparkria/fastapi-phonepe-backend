@@ -615,7 +615,7 @@ from passlib.context import CryptContext
 import razorpay
 
 # =====================================================
-# ENV
+# ENVIRONMENT
 # =====================================================
 env_path = Path(__file__).resolve().parent / ".env"
 load_dotenv(env_path)
@@ -626,7 +626,7 @@ RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
 RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
 
 if not all([SUPABASE_URL, SUPABASE_SERVICE_KEY, RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET]):
-    raise RuntimeError("❌ Missing required environment variables")
+    raise RuntimeError("Missing required environment variables")
 
 # =====================================================
 # LOGGING
@@ -638,20 +638,18 @@ logger.setLevel(logging.INFO)
 # CLIENTS
 # =====================================================
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-razorpay_client = razorpay.Client(
-    auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET)
-)
+razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # =====================================================
-# FASTAPI
+# FASTAPI APP
 # =====================================================
-app = FastAPI(title="Parkria Backend – Full API + Razorpay")
+app = FastAPI(title="Parkria Backend – Production (Razorpay)")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tighten later
+    allow_origins=["*"],  # tighten in prod if needed
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -681,8 +679,8 @@ class VehicleRequest(BaseModel):
 
 class PaymentRequest(BaseModel):
     booking_id: int
-    amount: int       # INR
-    user_id: str      # UUID
+    amount: int          # INR
+    user_id: str         # UUID
 
 class VerifyPaymentRequest(BaseModel):
     razorpay_order_id: str
@@ -694,14 +692,13 @@ class VerifyPaymentRequest(BaseModel):
 # =====================================================
 @app.get("/")
 def root():
-    return {"message": "🚀 Parkria Backend Running"}
+    return {"message": "🚀 Parkria Backend Running (Razorpay)"}
 
 # =====================================================
 # AUTH
 # =====================================================
 @app.post("/send-otp")
 def send_otp(req: SendOTPRequest):
-    # Demo OTP only
     return {"message": f"OTP sent to {req.phone}", "otp": "1234"}
 
 @app.post("/signup")
@@ -710,17 +707,14 @@ def signup(req: SignupRequest):
     if exists.data:
         raise HTTPException(400, "User already exists")
 
-    password_hash = pwd_context.hash(req.password)
-
+    hashed = pwd_context.hash(req.password)
     res = supabase.table("users").insert({
         "name": req.name,
         "phone": req.phone,
-        "password_hash": password_hash
+        "password_hash": hashed
     }).execute()
 
-    user = res.data[0]
-    user.pop("password_hash", None)
-    return {"user": user}
+    return {"user": res.data[0]}
 
 @app.post("/login")
 def login(req: LoginRequest):
@@ -745,10 +739,11 @@ def add_vehicle(req: VehicleRequest):
 
 @app.get("/vehicles")
 def get_vehicles(user_id: str = Query(...)):
-    return supabase.table("vehicles").select("*").eq("user_id", user_id).execute().data
+    res = supabase.table("vehicles").select("*").eq("user_id", user_id).execute()
+    return res.data
 
 # =====================================================
-# SERVICES & PARKING SLOTS
+# SERVICES & PARKING
 # =====================================================
 @app.get("/services")
 def get_services():
@@ -766,16 +761,12 @@ def create_payment(req: PaymentRequest):
     if req.amount <= 0:
         raise HTTPException(400, "Invalid amount")
 
-    try:
-        order = razorpay_client.order.create({
-            "amount": req.amount * 100,  # paise
-            "currency": "INR",
-            "receipt": f"booking_{req.booking_id}",
-            "payment_capture": 1
-        })
-    except Exception as e:
-        logger.exception("Razorpay order creation failed")
-        raise HTTPException(502, str(e))
+    order = razorpay_client.order.create({
+        "amount": req.amount * 100,
+        "currency": "INR",
+        "receipt": f"booking_{req.booking_id}",
+        "payment_capture": 1
+    })
 
     merchant_order_id = f"rzp-{req.booking_id}-{int(datetime.utcnow().timestamp())}"
 
@@ -846,3 +837,4 @@ def payment_success():
       </body>
     </html>
     """)
+
