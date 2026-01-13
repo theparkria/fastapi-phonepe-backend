@@ -883,8 +883,35 @@ def book_slot(data: ParkingSlotBookRequest):
 # -------------------------------------------------
 @app.post("/create-payment")
 def create_payment(req: PaymentRequest):
-    amount_paise = req.amount * 100
+    # 1️⃣ Fetch pricing config
+    pricing = supabase.table("parking_pricing") \
+        .select("monthly_price, advance_multiplier, is_test_enabled, test_amount") \
+        .limit(1).execute()
 
+    if not pricing.data:
+        raise HTTPException(500, "Pricing configuration missing")
+
+    p = pricing.data[0]
+
+    monthly_price = int(p["monthly_price"])
+    advance_multiplier = int(p["advance_multiplier"])
+    is_test_enabled = p["is_test_enabled"]
+    test_amount = int(p["test_amount"] or 1)
+
+    # 2️⃣ Validate amount
+    min_advance = monthly_price * advance_multiplier
+
+    if is_test_enabled and req.amount == test_amount:
+        final_amount = test_amount
+    else:
+        if req.amount < min_advance:
+            raise HTTPException(400, "Invalid payment amount")
+        final_amount = req.amount
+
+    # 3️⃣ Convert to paise
+    amount_paise = final_amount * 100
+
+    # 4️⃣ Create Razorpay order
     order = razorpay_client.order.create({
         "amount": amount_paise,
         "currency": "INR",
@@ -907,6 +934,7 @@ def create_payment(req: PaymentRequest):
         "amount": amount_paise,
         "currency": "INR"
     }
+
 
 @app.post("/verify-payment")
 def verify_payment(req: VerifyPaymentRequest):
