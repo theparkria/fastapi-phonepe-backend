@@ -883,9 +883,6 @@ def book_slot(data: ParkingSlotBookRequest):
 # -------------------------------------------------
 # PAYMENTS – RAZORPAY
 # -------------------------------------------------
-# -------------------------------------------------
-# PAYMENTS – RAZORPAY
-# -------------------------------------------------
 @app.post("/create-payment")
 def create_payment(req: PaymentRequest):
     # 1️⃣ Fetch pricing config
@@ -912,34 +909,22 @@ def create_payment(req: PaymentRequest):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid amount format")
 
-    # 3️⃣ TEST MODE OVERRIDE (₹1 allowed only if enabled)
+    # 3️⃣ TEST MODE OVERRIDE
     if is_test_enabled and requested_amount == test_amount:
         final_amount = test_amount
     else:
-        min_advance = monthly_price * advance_multiplier
-        if requested_amount < min_advance:
+        min_amount = monthly_price * advance_multiplier
+        if requested_amount < min_amount:
             raise HTTPException(
                 status_code=400,
-                detail=f"Invalid payment amount. Minimum is {min_advance}",
+                detail=f"Invalid payment amount. Minimum is {min_amount}",
             )
         final_amount = requested_amount
 
     # 4️⃣ Convert to paise
     amount_paise = final_amount * 100
 
-    # 5️⃣ Prevent duplicate payment
-    existing = (
-        supabase.table("orders")
-        .select("id")
-        .eq("booking_id", req.booking_id)
-        .eq("status", "CREATED")
-        .execute()
-    )
-
-    if existing.data:
-        raise HTTPException(status_code=409, detail="Payment already initiated")
-
-    # 6️⃣ Create Razorpay order (SAFE)
+    # 5️⃣ Create Razorpay order
     try:
         order = razorpay_client.order.create({
             "amount": amount_paise,
@@ -950,10 +935,10 @@ def create_payment(req: PaymentRequest):
     except requests.exceptions.RequestException:
         raise HTTPException(
             status_code=502,
-            detail="Payment gateway temporarily unavailable. Please try again.",
+            detail="Payment gateway temporarily unavailable",
         )
 
-    # 7️⃣ Store order in DB
+    # 6️⃣ Store order
     supabase.table("orders").insert({
         "merchant_order_id": f"rzp-{req.booking_id}-{int(datetime.utcnow().timestamp())}",
         "booking_id": req.booking_id,
@@ -970,6 +955,7 @@ def create_payment(req: PaymentRequest):
         "amount": amount_paise,
         "currency": "INR",
     }
+
 
 
 # -------------------------------------------------
