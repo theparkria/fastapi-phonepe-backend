@@ -615,6 +615,8 @@ from passlib.context import CryptContext
 from passlib.exc import UnknownHashError
 
 import razorpay
+import requests
+import time
 
 # -------------------------------------------------
 # ENV SETUP
@@ -881,79 +883,128 @@ def book_slot(data: ParkingSlotBookRequest):
 # -------------------------------------------------
 # PAYMENTS – RAZORPAY
 # -------------------------------------------------
+# -------------------------------------------------
+# PAYMENTS – RAZORPAY
+# -------------------------------------------------
 @app.post("/create-payment")
 def create_payment(req: PaymentRequest):
     # 1️⃣ Fetch pricing config
-    pricing = supabase.table("parking_pricing") \
-        .select("monthly_price, advance_multiplier, is_test_enabled, test_amount") \
-        .limit(1).execute()
+    pricing = (
+        supabase.table("parking_pricing")
+        .select("monthly_price, advance_multiplier, is_test_enabled, test_amount")
+        .limit(1)
+        .execute()
+    )
 
     if not pricing.data:
-        raise HTTPException(500, "Pricing configuration missing")
+        raise HTTPException(status_code=500, detail="Pricing configuration missing")
 
     p = pricing.data[0]
 
     monthly_price = int(p["monthly_price"])
     advance_multiplier = int(p["advance_multiplier"])
-    is_test_enabled = p["is_test_enabled"]
+    is_test_enabled = bool(p["is_test_enabled"])
     test_amount = int(p["test_amount"] or 1)
 
-    # 2️⃣ Validate amount
-    min_advance = monthly_price * advance_multiplier
+    # 2️⃣ Normalize request amount
+    try:
+        requested_amount = int(req.amount)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid amount format")
 
-    if is_test_enabled and req.amount == test_amount:
+    # 3️⃣ TEST MODE OVERRIDE (₹1 allowed only if enabled)
+    if is_test_enabled and requested_amount == test_amount:
         final_amount = test_amount
     else:
-        if req.amount < min_advance:
-            raise HTTPException(400, "Invalid payment amount")
-        final_amount = req.amount
+        min_advance = monthly_price * advance_multiplier
+        if requested_amount < min_advance:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid payment amount. Minimum is {min_advance}",
+            )
+        final_amount = requested_amount
 
-    # 3️⃣ Convert to paise
+    # 4️⃣ Convert to paise
     amount_paise = final_amount * 100
 
-    # 4️⃣ Create Razorpay order
-    order = razorpay_client.order.create({
-        "amount": amount_paise,
-        "currency": "INR",
-        "receipt": f"booking_{req.booking_id}",
-        "payment_capture": 1
-    })
+    # 5️⃣ Prevent duplicate payment
+    existing = (
+        supabase.table("orders")
+        .select("id")
+        .eq("booking_id", req.booking_id)
+        .eq("status", "CREATED")
+        .execute()
+    )
 
+    if existing.data:
+        raise HTTPException(status_code=409, detail="Payment already initiated")
+
+    # 6️⃣ Create Razorpay order (SAFE)
+    try:
+        order = razorpay_client.order.create({
+            "amount": amount_paise,
+            "currency": "INR",
+            "receipt": f"booking_{req.booking_id}_{int(time.time())}",
+            "payment_capture": 1,
+        })
+    except requests.exceptions.RequestException:
+        raise HTTPException(
+            status_code=502,
+            detail="Payment gateway temporarily unavailable. Please try again.",
+        )
+
+    # 7️⃣ Store order in DB
     supabase.table("orders").insert({
         "merchant_order_id": f"rzp-{req.booking_id}-{int(datetime.utcnow().timestamp())}",
         "booking_id": req.booking_id,
         "user_id": req.user_id,
         "amount": amount_paise,
         "status": "CREATED",
-        "razorpay_order_id": order["id"]
+        "razorpay_order_id": order["id"],
+        "created_at": datetime.utcnow().isoformat(),
     }).execute()
 
     return {
         "razorpay_key": RAZORPAY_KEY_ID,
         "order_id": order["id"],
         "amount": amount_paise,
-        "currency": "INR"
+        "currency": "INR",
     }
 
 
+# -------------------------------------------------
+# VERIFY PAYMENT
+# -------------------------------------------------
 @app.post("/verify-payment")
 def verify_payment(req: VerifyPaymentRequest):
     body = f"{req.razorpay_order_id}|{req.razorpay_payment_id}"
-    expected = hmac.new(
+
+    expected_signature = hmac.new(
         RAZORPAY_KEY_SECRET.encode(),
         body.encode(),
-        hashlib.sha256
+        hashlib.sha256,
     ).hexdigest()
 
-    if not hmac.compare_digest(expected, req.razorpay_signature):
-        raise HTTPException(400, "Invalid signature")
+    if not hmac.compare_digest(expected_signature, req.razorpay_signature):
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    order = (
+        supabase.table("orders")
+        .select("id")
+        .eq("razorpay_order_id", req.razorpay_order_id)
+        .execute()
+    )
+
+    if not order.data:
+        raise HTTPException(status_code=404, detail="Order not found")
 
     supabase.table("orders").update({
         "status": "PAID",
-        "updated_at": datetime.utcnow().isoformat()
+        "updated_at": datetime.utcnow().isoformat(),
     }).eq("razorpay_order_id", req.razorpay_order_id).execute()
 
     return {"status": "success"}
+
 
 # -------------------------------------------------
 # PAYMENT SUCCESS PAGE
@@ -961,6 +1012,10 @@ def verify_payment(req: VerifyPaymentRequest):
 @app.get("/payment-success")
 def payment_success():
     return HTMLResponse("""
-    <html><body><h2>Payment Completed</h2>
-    <p>You may close this window.</p></body></html>
+    <html>
+      <body>
+        <h2>Payment Completed</h2>
+        <p>You may close this window.</p>
+      </body>
+    </html>
     """)
