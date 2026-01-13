@@ -239,10 +239,10 @@ def verify_password(password: str, hashed: str) -> bool:
 # Request Models
 # ========================
 class PasswordChangeRequest(BaseModel):
-    user_id: str
     old_password: str
     new_password: str
     confirm_password: str
+
 
 class OTPRequest(BaseModel):
     phone: str
