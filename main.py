@@ -613,6 +613,9 @@ from pydantic import BaseModel
 from supabase import create_client, Client
 from passlib.context import CryptContext
 from passlib.exc import UnknownHashError
+from auth import router as auth_router
+from routes.auth import router as auth_router
+
 
 import razorpay
 import requests
@@ -648,6 +651,8 @@ razorpay_client = razorpay.Client(
 # APP INIT
 # -------------------------------------------------
 app = FastAPI()
+app.include_router(auth_router)
+
 
 app.add_middleware(
     CORSMiddleware,
