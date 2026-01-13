@@ -614,7 +614,8 @@ from supabase import create_client, Client
 from passlib.context import CryptContext
 from passlib.exc import UnknownHashError
 from auth import router as auth_router
-from routes.auth import router as auth_router
+from auth import router as auth_router
+
 
 
 import razorpay
