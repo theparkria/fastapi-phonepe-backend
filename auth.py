@@ -139,7 +139,41 @@ async def verify_otp(data: OTPVerify):
 
 
 
+class SignupRequest(BaseModel):
+    name: str
+    phone: str
+    password: str
 
+
+@router.post("/signup")
+async def signup(data: SignupRequest):
+    try:
+        logger.info(f"📝 Signup request: {data.dict()}")
+
+        # Check if user already exists
+        existing = supabase.table("users").select("id").eq("phone", data.phone).execute()
+        if existing.data:
+            raise HTTPException(status_code=400, detail="User already exists")
+
+        hashed_password = hash_password(data.password)
+
+        response = supabase.table("users").insert({
+            "name": data.name,
+            "phone": data.phone,
+            "password_hash": hashed_password
+        }).execute()
+
+        if not response.data:
+            raise HTTPException(status_code=500, detail="Signup failed")
+
+        user_id = response.data[0]["id"]
+
+        logger.info("✅ User created successfully")
+        return {"message": "Signup successful", "user_id": user_id}
+
+    except Exception as e:
+        logger.error(f"❌ Signup error: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 
