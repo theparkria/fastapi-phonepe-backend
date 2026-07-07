@@ -859,6 +859,16 @@ def consume_token(data: ConsumeTokenRequest):
 
     return {"message": "Token consumed"}
 
+@app.get("/user-tokens")
+def get_user_tokens(user_id: str = Query(...), service_type_id: int = Query(...)):
+    response = supabase.table("purchased_tokens")\
+        .select("token_count")\
+        .eq("user_id", user_id)\
+        .eq("service_type_id", service_type_id)\
+        .execute()
+    total_tokens = sum(row.get("token_count", 0) for row in response.data or [])
+    return {"tokens": total_tokens}
+
 # -------------------------------------------------
 # PARKING
 # -------------------------------------------------
