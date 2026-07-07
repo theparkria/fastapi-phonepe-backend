@@ -1283,3 +1283,90 @@ def verify_service_payment(req: VerifyServicePaymentRequest):
         "message": "Service payment completed"
 
     }
+
+
+# -------------------------------------------------
+# PAYMENT HISTORY
+# -------------------------------------------------
+@app.get("/payment-history")
+def payment_history(user_id: str = Query(...)):
+
+    history = []
+
+    # ---------------------------------------------
+    # PARKING PAYMENTS
+    # ---------------------------------------------
+    parking = (
+        supabase.table("orders")
+        .select("*")
+        .eq("user_id", user_id)
+        .eq("status", "PAID")
+        .order("created_at", desc=True)
+        .execute()
+    )
+
+    for row in parking.data or []:
+
+        history.append({
+
+            "user_id": row["user_id"],
+
+            "amount": row["amount"] / 100,
+
+            "payment_date": row["updated_at"] or row["created_at"],
+
+            "order_id": row["merchant_order_id"],
+
+            "service_type": "Monthly Parking"
+
+        })
+
+    # ---------------------------------------------
+    # SERVICE PAYMENTS
+    # ---------------------------------------------
+    services = (
+        supabase.table("service_orders")
+        .select("*")
+        .eq("user_id", user_id)
+        .eq("status", "PAID")
+        .order("created_at", desc=True)
+        .execute()
+    )
+
+    for row in services.data or []:
+
+        service = (
+            supabase.table("service_types")
+            .select("service_name")
+            .eq("service_type_id", row["service_type_id"])
+            .execute()
+        )
+
+        service_name = "Service"
+
+        if service.data:
+            service_name = service.data[0]["service_name"]
+
+        history.append({
+
+            "user_id": row["user_id"],
+
+            "amount": row["total_amount"],
+
+            "payment_date": row["updated_at"] or row["created_at"],
+
+            "order_id": row["merchant_order_id"],
+
+            "service_type": service_name
+
+        })
+
+    # ---------------------------------------------
+    # SORT BY DATE
+    # ---------------------------------------------
+    history.sort(
+        key=lambda x: x["payment_date"] or "",
+        reverse=True,
+    )
+
+    return history
