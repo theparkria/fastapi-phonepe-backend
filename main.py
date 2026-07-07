@@ -724,6 +724,20 @@ class PaymentRequest(BaseModel):
     amount: int   # rupees
     user_id: str
 
+# -------------------------------------------------
+# SERVICE PAYMENT REQUEST
+# -------------------------------------------------
+class ServicePaymentRequest(BaseModel):
+    user_id: str
+    service_type_id: int
+    token_count: int
+
+
+class VerifyServicePaymentRequest(BaseModel):
+    razorpay_order_id: str
+    razorpay_payment_id: str
+    razorpay_signature: str
+
 class VerifyPaymentRequest(BaseModel):
     razorpay_order_id: str
     razorpay_payment_id: str
@@ -1021,3 +1035,251 @@ def payment_success():
       </body>
     </html>
     """)
+
+
+
+
+
+# -------------------------------------------------
+# CREATE SERVICE PAYMENT
+# -------------------------------------------------
+@app.post("/create-service-payment")
+def create_service_payment(req: ServicePaymentRequest):
+
+    # Get service
+    service = (
+        supabase.table("service_types")
+        .select("*")
+        .eq("service_type_id", req.service_type_id)
+        .execute()
+    )
+
+    if not service.data:
+        raise HTTPException(
+            status_code=404,
+            detail="Service not found"
+        )
+
+    service = service.data[0]
+
+    price_per_token = float(service["price"])
+
+    subtotal = price_per_token * req.token_count
+
+    discount = 0
+
+    if req.token_count >= 10:
+        discount = subtotal * 0.10
+
+    final_amount = subtotal - discount
+
+    amount_paise = int(final_amount * 100)
+
+    try:
+
+        order = razorpay_client.order.create({
+
+            "amount": amount_paise,
+
+            "currency": "INR",
+
+            "receipt": f"service_{int(time.time())}",
+
+            "payment_capture": 1
+
+        })
+
+    except Exception as e:
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+    merchant_order_id = f"SRV-{int(time.time())}"
+
+    supabase.table("service_orders").insert({
+
+        "merchant_order_id": merchant_order_id,
+
+        "razorpay_order_id": order["id"],
+
+        "user_id": req.user_id,
+
+        "service_type_id": req.service_type_id,
+
+        "token_count": req.token_count,
+
+        "price_per_token": price_per_token,
+
+        "discount": discount,
+
+        "total_amount": final_amount,
+
+        "status": "CREATED",
+
+        "created_at": datetime.utcnow().isoformat()
+
+    }).execute()
+
+    return {
+
+        "razorpay_key": RAZORPAY_KEY_ID,
+
+        "order_id": order["id"],
+
+        "amount": amount_paise,
+
+        "currency": "INR"
+
+    }
+
+
+# -------------------------------------------------
+# VERIFY SERVICE PAYMENT
+# -------------------------------------------------
+@app.post("/verify-service-payment")
+def verify_service_payment(req: VerifyServicePaymentRequest):
+
+    # -------------------------------------------------
+    # Verify Razorpay Signature
+    # -------------------------------------------------
+
+    body = f"{req.razorpay_order_id}|{req.razorpay_payment_id}"
+
+    expected_signature = hmac.new(
+        RAZORPAY_KEY_SECRET.encode(),
+        body.encode(),
+        hashlib.sha256,
+    ).hexdigest()
+
+    if not hmac.compare_digest(
+        expected_signature,
+        req.razorpay_signature
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid payment signature"
+        )
+
+    # -------------------------------------------------
+    # Fetch Service Order
+    # -------------------------------------------------
+
+    order = (
+        supabase.table("service_orders")
+        .select("*")
+        .eq("razorpay_order_id", req.razorpay_order_id)
+        .execute()
+    )
+
+    if not order.data:
+        raise HTTPException(
+            status_code=404,
+            detail="Service order not found"
+        )
+
+    service_order = order.data[0]
+
+    if service_order["status"] == "PAID":
+        return {
+            "status": "success",
+            "message": "Payment already processed"
+        }
+
+    # -------------------------------------------------
+    # Update Service Order
+    # -------------------------------------------------
+
+    supabase.table("service_orders").update({
+
+        "status": "PAID",
+
+        "razorpay_payment_id": req.razorpay_payment_id,
+
+        "updated_at": datetime.utcnow().isoformat()
+
+    }).eq(
+        "razorpay_order_id",
+        req.razorpay_order_id
+    ).execute()
+
+    # -------------------------------------------------
+    # Update Purchased Tokens
+    # -------------------------------------------------
+
+    existing = (
+        supabase.table("purchased_tokens")
+        .select("*")
+        .eq("user_id", service_order["user_id"])
+        .eq("service_type_id", service_order["service_type_id"])
+        .execute()
+    )
+
+    if existing.data:
+
+        token = existing.data[0]
+
+        supabase.table("purchased_tokens").update({
+
+            "token_count":
+                token["token_count"] + service_order["token_count"],
+
+            "updated_at":
+                datetime.utcnow().isoformat()
+
+        }).eq(
+            "token_id",
+            token["token_id"]
+        ).execute()
+
+    else:
+
+        supabase.table("purchased_tokens").insert({
+
+            "user_id": service_order["user_id"],
+
+            "service_type_id": service_order["service_type_id"],
+
+            "token_count": service_order["token_count"],
+
+            "purchase_date": datetime.utcnow().isoformat(),
+
+            "created_at": datetime.utcnow().isoformat(),
+
+            "updated_at": datetime.utcnow().isoformat()
+
+        }).execute()
+
+    # -------------------------------------------------
+    # Transaction History
+    # -------------------------------------------------
+
+    supabase.table("transaction_history").insert({
+
+        "amount": service_order["total_amount"],
+
+        
+        "payment_method": "RAZORPAY",  
+
+        "timestamp": datetime.utcnow().isoformat(),
+
+        "purpose": "SERVICE_TOKEN",
+
+        "user_id": service_order["user_id"],
+
+        "status": "SUCCESS",
+
+        "created_at": datetime.utcnow().isoformat(),
+
+        "updated_at": datetime.utcnow().isoformat()
+
+    }).execute()
+
+    return {
+
+        "status": "success",
+
+        "message": "Service payment completed"
+
+    }
